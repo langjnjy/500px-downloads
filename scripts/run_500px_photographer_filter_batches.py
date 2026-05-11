@@ -4,6 +4,8 @@
 - 默认读取仓库内 ``config/run_500px_photographer_filter_batches.yaml``（若存在），可用 ``--config PATH`` /
   ``--no-config`` 覆盖；命令行参数优先于配置文件。
 - 每个子进程都会带上 ``--max-pages``（默认 50）：超过 50 页只取前 50 页；不足则有多少页拿多少。
+- ``--workers N``（或配置 ``limits.workers``）：并行跑多个 fetch 子进程（默认 1，与原先串行一致）。
+  多进程同时以追加模式写同一 ``--output`` 时，在 Linux 下通常为逐行小写入，一般可接受；仍需离线去重。
 - ``combo_seen_db`` 的组合键含 **sort**（由 ``fetch_extra_args`` 里的 ``--sort`` / ``--no-sort`` 推断，默认 RELEVANCE）。
   旧库仅有 ``s:|m:`` 的行在 **RELEVANCE** 下仍视为已见，避免重复跑历史数据。
 - ``--multiselect-combos-from-yaml``：从 filter id YAML 读 specialty / member id，
@@ -30,6 +32,13 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    CancelledError,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -179,6 +188,7 @@ def _defaults_and_fetch_extra_from_run_config(
     out["max_pages"] = int(lim.get("max_pages", cfg.get("max_pages", 50)))
     out["max_batches"] = int(lim.get("max_batches", cfg.get("max_batches", 0)))
     out["combo_offset"] = int(lim.get("combo_offset", cfg.get("combo_offset", 0)))
+    out["workers"] = int(lim.get("workers", cfg.get("workers", 1)))
     excl = ms.get("exclude_both_empty_combo")
     if excl is None:
         excl = cfg.get("exclude_both_empty_combo", False)
@@ -362,6 +372,30 @@ def _estimate_combo_count(n_spec: int, n_mem: int, exclude_both_empty: bool) -> 
     return total
 
 
+def _run_fetch_subprocess(cmd: Sequence[str], cwd: str) -> subprocess.CompletedProcess:
+    return subprocess.run(list(cmd), cwd=cwd)
+
+
+def _shutdown_executor(ex: ThreadPoolExecutor, *, cancel_futures: bool) -> None:
+    try:
+        ex.shutdown(wait=True, cancel_futures=cancel_futures)
+    except TypeError:
+        # Python < 3.9 无 cancel_futures
+        ex.shutdown(wait=True)
+
+
+def _future_completed_process(
+    f: Future,
+) -> Tuple[Optional[subprocess.CompletedProcess], Optional[BaseException]]:
+    """ThreadPool 里跑的 subprocess.run：正常返回 CompletedProcess；取消或其它异常单独返回。"""
+    try:
+        return f.result(), None
+    except CancelledError as exc:
+        return None, exc
+    except Exception as exc:
+        return None, exc
+
+
 def main() -> int:
     root = _repo_root()
     log, log_path = _init_batch_logger(root)
@@ -444,6 +478,12 @@ def main() -> int:
         action="store_true",
         help="只打印将执行的命令，不运行",
     )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="并行 fetch 子进程数（默认 1）；多选时 combo_seen 仅在主线程写入",
+    )
     ap.set_defaults(**yaml_defaults)
     args, fetch_extra_cli = ap.parse_known_args(argv_rest)
 
@@ -469,11 +509,12 @@ def main() -> int:
     max_pages_args = ["--max-pages", str(args.max_pages)]
     combo_sort_sig = _usersearch_sort_signature(extra_tail)
     log.info(
-        "output=%s max_pages=%s sort_sig=%s dry_run=%s",
+        "output=%s max_pages=%s sort_sig=%s dry_run=%s workers=%s",
         out,
         args.max_pages,
         combo_sort_sig,
         args.dry_run,
+        max(1, int(args.workers)),
     )
 
     if args.multiselect_combos_from_yaml is not None:
@@ -538,72 +579,197 @@ def main() -> int:
             exclude_both_empty=args.exclude_both_empty_combo,
         )
 
+        workers_n = max(1, int(args.workers))
+        log.info("multiselect workers=%s", workers_n)
+        if workers_n > 1:
+            print(f"并行 workers={workers_n}", flush=True)
+
+        pending: Dict[Future, Tuple[str, str]] = {}
+        early_exit = 0
+        ex = ThreadPoolExecutor(max_workers=workers_n)
+
         try:
-            for idx, (ss, ms) in enumerate(combo_iter):
-                if skip_leading > 0:
-                    skip_leading -= 1
-                    continue
-                if window_cap > 0 and slots_in_window >= window_cap:
-                    break
-                slots_in_window += 1
+            try:
+                for idx, (ss, ms) in enumerate(combo_iter):
+                    if early_exit != 0:
+                        break
+                    if skip_leading > 0:
+                        skip_leading -= 1
+                        continue
+                    if window_cap > 0 and slots_in_window >= window_cap:
+                        break
+                    slots_in_window += 1
 
-                filter_key = _combo_filter_key(ss, ms)
-                combo_key = _combo_stable_key(ss, ms, combo_sort_sig)
-                legacy_key = filter_key if combo_sort_sig == "RELEVANCE" else None
-                name = _combo_run_name(ss, ms, idx)
-                filters = _filters_from_combo(ss, ms)
+                    filter_key = _combo_filter_key(ss, ms)
+                    combo_key = _combo_stable_key(ss, ms, combo_sort_sig)
+                    legacy_key = filter_key if combo_sort_sig == "RELEVANCE" else None
+                    name = _combo_run_name(ss, ms, idx)
+                    filters = _filters_from_combo(ss, ms)
 
-                if seen_conn is not None and _combo_is_seen(
-                    seen_conn, combo_key, legacy_filter_key=legacy_key
-                ):
-                    skipped_seen += 1
-                    if skipped_seen <= 3 or skipped_seen % 50000 == 0:
-                        log.info(
-                            "跳过已见库 累计=%d key=%s",
-                            skipped_seen,
-                            combo_key,
-                        )
-                    if skipped_seen % 50000 == 0:
-                        print(f"已跳过 seen {skipped_seen} 组合", flush=True)
-                    continue
+                    if seen_conn is not None and _combo_is_seen(
+                        seen_conn, combo_key, legacy_filter_key=legacy_key
+                    ):
+                        skipped_seen += 1
+                        if skipped_seen <= 3 or skipped_seen % 50000 == 0:
+                            log.info(
+                                "跳过已见库 累计=%d key=%s",
+                                skipped_seen,
+                                combo_key,
+                            )
+                        if skipped_seen % 50000 == 0:
+                            print(f"已跳过 seen {skipped_seen} 组合", flush=True)
+                        continue
 
-                cmd = _build_fetch_cmd(
-                    root=root,
-                    fetch_script=fetch_script,
-                    out=out,
-                    filters=filters,
-                    extra_tail=extra_tail,
-                    max_pages_args=max_pages_args,
-                )
-
-                denom = window_cap if window_cap > 0 else est
-                log.info(
-                    "开始批次 slot=%s/%s idx=%s name=%s key=%s",
-                    slots_in_window,
-                    denom,
-                    idx,
-                    name,
-                    combo_key,
-                )
-                log.info("cmd %s", _cmd_join(cmd))
-                print(
-                    f"[{slots_in_window}/{denom}] {name}",
-                    flush=True,
-                )
-                if args.dry_run:
-                    continue
-                r = subprocess.run(cmd, cwd=str(root))
-                if r.returncode != 0:
-                    err = (
-                        f"批次失败 exit={r.returncode} name={name}（未写入 seen，可重跑）"
+                    cmd = _build_fetch_cmd(
+                        root=root,
+                        fetch_script=fetch_script,
+                        out=out,
+                        filters=filters,
+                        extra_tail=extra_tail,
+                        max_pages_args=max_pages_args,
                     )
-                    log.error(err)
-                    print(f"[错误] {err}", file=sys.stderr)
-                    return r.returncode
-                log.info("批次成功 name=%s", name)
+
+                    denom = window_cap if window_cap > 0 else est
+                    log.info(
+                        "开始批次 slot=%s/%s idx=%s name=%s key=%s",
+                        slots_in_window,
+                        denom,
+                        idx,
+                        name,
+                        combo_key,
+                    )
+                    log.info("cmd %s", _cmd_join(cmd))
+                    print(
+                        f"[{slots_in_window}/{denom}] {name}",
+                        flush=True,
+                    )
+                    if args.dry_run:
+                        continue
+
+                    fut = ex.submit(_run_fetch_subprocess, cmd, str(root))
+                    pending[fut] = (combo_key, name)
+
+                    while len(pending) >= workers_n and early_exit == 0:
+                        done, _ = wait(
+                            pending.keys(), return_when=FIRST_COMPLETED
+                        )
+                        for f in done:
+                            ck, nm = pending.pop(f)
+                            r, fut_exc = _future_completed_process(f)
+                            if fut_exc is not None:
+                                if isinstance(fut_exc, CancelledError):
+                                    log.info(
+                                        "批次已取消（未写入 seen）name=%s", nm
+                                    )
+                                    continue
+                                log.error(
+                                    "批次异常 name=%s: %s（未写入 seen）",
+                                    nm,
+                                    fut_exc,
+                                    exc_info=True,
+                                )
+                                print(
+                                    f"[错误] 批次异常 name={nm}: {fut_exc}",
+                                    file=sys.stderr,
+                                )
+                                early_exit = 1
+                                break
+                            assert r is not None
+                            if r.returncode != 0:
+                                err = (
+                                    f"批次失败 exit={r.returncode} name={nm}"
+                                    "（未写入 seen，可重跑）"
+                                )
+                                log.error(err)
+                                print(f"[错误] {err}", file=sys.stderr)
+                                early_exit = r.returncode
+                                break
+                            log.info("批次成功 name=%s", nm)
+                            if seen_conn is not None:
+                                _combo_mark_seen(seen_conn, ck)
+                            ran_ok += 1
+                        if early_exit != 0:
+                            break
+
+                while pending and early_exit == 0:
+                    done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                    for f in done:
+                        ck, nm = pending.pop(f)
+                        r, fut_exc = _future_completed_process(f)
+                        if fut_exc is not None:
+                            if isinstance(fut_exc, CancelledError):
+                                log.info(
+                                    "批次已取消（未写入 seen）name=%s", nm
+                                )
+                                continue
+                            log.error(
+                                "批次异常 name=%s: %s（未写入 seen）",
+                                nm,
+                                fut_exc,
+                                exc_info=True,
+                            )
+                            print(
+                                f"[错误] 批次异常 name={nm}: {fut_exc}",
+                                file=sys.stderr,
+                            )
+                            early_exit = 1
+                            break
+                        assert r is not None
+                        if r.returncode != 0:
+                            err = (
+                                f"批次失败 exit={r.returncode} name={nm}"
+                                "（未写入 seen，可重跑）"
+                            )
+                            log.error(err)
+                            print(f"[错误] {err}", file=sys.stderr)
+                            early_exit = r.returncode
+                            break
+                        log.info("批次成功 name=%s", nm)
+                        if seen_conn is not None:
+                            _combo_mark_seen(seen_conn, ck)
+                        ran_ok += 1
+                    if early_exit != 0:
+                        break
+
+            finally:
+                _shutdown_executor(ex, cancel_futures=bool(early_exit))
+
+            for f in list(pending.keys()):
+                ck, nm = pending.pop(f)
+                r, fut_exc = _future_completed_process(f)
+                if fut_exc is not None:
+                    if isinstance(fut_exc, CancelledError):
+                        log.info("批次已取消（未写入 seen）name=%s", nm)
+                        continue
+                    if early_exit == 0:
+                        log.error(
+                            "批次异常 name=%s: %s（未写入 seen）",
+                            nm,
+                            fut_exc,
+                            exc_info=True,
+                        )
+                        print(
+                            f"[错误] 批次异常 name={nm}: {fut_exc}",
+                            file=sys.stderr,
+                        )
+                        early_exit = 1
+                    continue
+                assert r is not None
+                if r.returncode != 0:
+                    if early_exit == 0:
+                        err = (
+                            f"批次失败 exit={r.returncode} name={nm}"
+                            "（未写入 seen，可重跑）"
+                        )
+                        log.error(err)
+                        print(f"[错误] {err}", file=sys.stderr)
+                        early_exit = r.returncode
+                    continue
+                log.info("批次成功 name=%s", nm)
                 if seen_conn is not None:
-                    _combo_mark_seen(seen_conn, combo_key)
+                    _combo_mark_seen(seen_conn, ck)
                 ran_ok += 1
+
         finally:
             if seen_conn is not None:
                 seen_conn.close()
@@ -617,6 +783,8 @@ def main() -> int:
             log.info("dry-run 未执行抓取")
             print("（dry-run）", flush=True)
             return 0
+        if early_exit != 0:
+            return early_exit
         log.info("每批最多 %s 页；输出请离线去重", args.max_pages)
         print(f"每批最多 {args.max_pages} 页；输出请离线去重。", flush=True)
         return 0
@@ -636,6 +804,7 @@ def main() -> int:
     runs: List[Dict[str, Any]] = loaded
     log.info("runs 模式 batches_yaml=%s 共 %d 条", by, len(runs))
 
+    jobs: List[Tuple[int, str, List[str]]] = []
     for i, run in enumerate(runs):
         if not isinstance(run, dict):
             continue
@@ -660,20 +829,127 @@ def main() -> int:
         log.info("开始 run %s/%s name=%s", i + 1, len(runs), name)
         log.info("cmd %s", _cmd_join(cmd))
         print(f"[{i + 1}/{len(runs)}] {name}", flush=True)
-        if args.dry_run:
-            continue
-        r = subprocess.run(cmd, cwd=str(root))
-        if r.returncode != 0:
-            err = f"批次失败 exit={r.returncode} name={name}"
-            log.error(err)
-            print(f"[错误] {err}", file=sys.stderr)
-            return r.returncode
-        log.info("批次成功 name=%s", name)
+        jobs.append((i, name, cmd))
 
     if args.dry_run:
         log.info("dry-run 未执行抓取")
         print("（dry-run）", flush=True)
         return 0
+
+    workers_n = max(1, int(args.workers))
+    log.info("runs 模式 workers=%s", workers_n)
+    if workers_n > 1:
+        print(f"并行 workers={workers_n}", flush=True)
+
+    pending_r: Dict[Future, str] = {}
+    early_exit = 0
+    ex_r = ThreadPoolExecutor(max_workers=workers_n)
+    try:
+        for _, (_, name, cmd) in enumerate(jobs):
+            if early_exit != 0:
+                break
+            fut = ex_r.submit(_run_fetch_subprocess, cmd, str(root))
+            pending_r[fut] = name
+            while len(pending_r) >= workers_n and early_exit == 0:
+                done, _ = wait(pending_r.keys(), return_when=FIRST_COMPLETED)
+                for f in done:
+                    nm = pending_r.pop(f)
+                    r, fut_exc = _future_completed_process(f)
+                    if fut_exc is not None:
+                        if isinstance(fut_exc, CancelledError):
+                            log.info("批次已取消 name=%s", nm)
+                            continue
+                        log.error(
+                            "批次异常 name=%s: %s",
+                            nm,
+                            fut_exc,
+                            exc_info=True,
+                        )
+                        print(
+                            f"[错误] 批次异常 name={nm}: {fut_exc}",
+                            file=sys.stderr,
+                        )
+                        early_exit = 1
+                        break
+                    assert r is not None
+                    if r.returncode != 0:
+                        err = f"批次失败 exit={r.returncode} name={nm}"
+                        log.error(err)
+                        print(f"[错误] {err}", file=sys.stderr)
+                        early_exit = r.returncode
+                        break
+                    log.info("批次成功 name=%s", nm)
+                if early_exit != 0:
+                    break
+
+        while pending_r and early_exit == 0:
+            done, _ = wait(pending_r.keys(), return_when=FIRST_COMPLETED)
+            for f in done:
+                nm = pending_r.pop(f)
+                r, fut_exc = _future_completed_process(f)
+                if fut_exc is not None:
+                    if isinstance(fut_exc, CancelledError):
+                        log.info("批次已取消 name=%s", nm)
+                        continue
+                    log.error(
+                        "批次异常 name=%s: %s",
+                        nm,
+                        fut_exc,
+                        exc_info=True,
+                    )
+                    print(
+                        f"[错误] 批次异常 name={nm}: {fut_exc}",
+                        file=sys.stderr,
+                    )
+                    early_exit = 1
+                    break
+                assert r is not None
+                if r.returncode != 0:
+                    err = f"批次失败 exit={r.returncode} name={nm}"
+                    log.error(err)
+                    print(f"[错误] {err}", file=sys.stderr)
+                    early_exit = r.returncode
+                    break
+                log.info("批次成功 name=%s", nm)
+            if early_exit != 0:
+                break
+
+    finally:
+        _shutdown_executor(ex_r, cancel_futures=bool(early_exit))
+
+    for f in list(pending_r.keys()):
+        nm = pending_r.pop(f)
+        r, fut_exc = _future_completed_process(f)
+        if fut_exc is not None:
+            if isinstance(fut_exc, CancelledError):
+                log.info("批次已取消 name=%s", nm)
+                continue
+            if early_exit == 0:
+                log.error(
+                    "批次异常 name=%s: %s",
+                    nm,
+                    fut_exc,
+                    exc_info=True,
+                )
+                print(
+                    f"[错误] 批次异常 name={nm}: {fut_exc}",
+                    file=sys.stderr,
+                )
+                early_exit = 1
+            continue
+        assert r is not None
+        if r.returncode != 0:
+            if early_exit == 0:
+                err = f"批次失败 exit={r.returncode} name={nm}"
+                log.error(err)
+                print(f"[错误] {err}", file=sys.stderr)
+                early_exit = r.returncode
+            continue
+        log.info("批次成功 name=%s", nm)
+
+    if early_exit != 0:
+        return early_exit
+
     tail = f"全部批次结束（每批最多 {args.max_pages} 页）。请对输出离线去重。"
     log.info(tail)
     print(tail, flush=True)

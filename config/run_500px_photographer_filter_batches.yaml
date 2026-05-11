@@ -25,26 +25,15 @@ limits:
   max_pages: 50
   max_batches: 0
   combo_offset: 0
+  # workers: 4   # 并行 fetch 子进程数（默认 1）；也可用命令行 --workers
 
 # 传给 fetch_500px_photographers_all.py 的额外 argv（逐参数一项）
 fetch_extra_args:
-  - --cookies
-  - config/500px_cookies.txt
+  # - --cookies
+  # - config/500px_cookies.txt
   - --sleep
   - "0.35"
   - --sort
-  - RELEVANCE          # 排序：RELEVANCE / MOST_POPULAR / MOST_RECENT
-
-# fetch_extra_args:
-#   - --cookies
-#   - config/500px_cookies.txt
-#   - --sleep
-#   - "0.35"
-#   - --sort
-#   - MOST_POPULAR          # 排序：RELEVANCE / MOST_POPULAR / MOST_RECENT
-#   - --page-size
-#   - "200"
-#   - --max-no-progress-pages
-#   - "5"
+  - MOST_POPULAR          # 排序：RELEVANCE / MOST_POPULAR / MOST_RECENT
 
 dry_run: false
