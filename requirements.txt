@@ -1,0 +1,5 @@
+# Python 3.10+ 建议
+requests>=2.28.0
+PyYAML>=6.0
+# 可选：从 Chrome 导出 Cookie（export_chrome_cookies_500px.py）
+browser-cookie3>=0.19.0

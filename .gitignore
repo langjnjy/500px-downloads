@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 敏感与本地配置（勿提交真实 Cookie）
+config/*cookies*.txt
+config/*secret*
+*.pem
+
+# 产出与状态（体积大）
+output/
+*.db
+*.sqlite
+*.jsonl
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Go（go-downloader 子模块编译产物）
+go-downloader/download
+go-downloader/*.exe
+go-downloader/coverage.out

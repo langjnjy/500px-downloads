@@ -1,0 +1,69 @@
+# 在线探测 api.500px.com/graphql userSearch(filters: [...]) 得到（2026-05-08）。
+# value 须为字符串数字。标签与网页 17 类 specialty / 3 类 membership 的对应请用浏览器 DevTools 核对。
+#
+# 探测命令见仓库内说明或自行重跑 scripts 下探测逻辑。
+
+specialties:
+  # 共 18 个 ID 在 1–80 扫描内有 totalCount>0（网页常称 17 类，可能有一类合并或 UI 未单独列出）
+  - id: "1"
+    total_count: 44959
+  - id: "2"
+    total_count: 15940
+  - id: "3"
+    total_count: 33793
+  - id: "4"
+    total_count: 31455
+  - id: "5"
+    total_count: 24980
+  - id: "6"
+    total_count: 17809
+  - id: "7"
+    total_count: 47192
+  - id: "8"
+    total_count: 11787
+  - id: "9"
+    total_count: 131436
+  - id: "10"
+    total_count: 37930
+  - id: "11"
+    total_count: 28566
+  - id: "12"
+    total_count: 77644
+  - id: "13"
+    total_count: 21388
+  - id: "14"
+    total_count: 32033
+  - id: "15"
+    total_count: 50302
+  - id: "16"
+    total_count: 27892
+  - id: "17"
+    total_count: 3690
+  - id: "18"
+    total_count: 1005
+
+member_types:
+  # 本段是「API 探测结果」，不是「网页上会员有几种 UI 状态」的穷举。
+  #
+  # 网页：Membership 常是 Pro / Awesome / Free 三个勾选项，再加「都不勾」≈ 4 种语义；
+  # 但 userSearch 的 MEMBER_TYPE 只接受数字 value。我们对 0–199 逐个数时，只有下面几条
+  # totalCount>0。其余 ID 返回 0 人（或等价于未建索引），不等于「少一种会员」，更不等于
+  # 「不选」只有 3 种 case。
+  #
+  # 「不选会员」在脚本里通常是：根本不要加 --filter MEMBER_TYPE（filters 里不出现该项）。
+  # 这与传 MEMBER_TYPE value "0" 是否完全等价，要以 DevTools 里网站真实请求为准。
+  #
+  # 第三档会员（若 Pro/Awesome/Free 要占 3 个 ID）可能仍是别的数字、或走别的 key /
+  # 多 filter，请用 Network 里 graphql 的 variables 核对后再补全本表。
+  - id: "0"
+    total_count: 25798941
+    note: 不按 MEMBER_TYPE 过滤时的语义；与「不勾选 membership」可能一致，需 DevTools 核对
+  - id: "8"
+    total_count: 8434
+    note: 可能对应 Pro / Awesome / Free 之一，须 DevTools 核对
+  - id: "12"
+    total_count: 3097
+    note: 可能对应 Pro / Awesome / Free 之一，须 DevTools 核对
+
+# 网页勾选 Pro+Awesome+Free 三个独立 checkbox 时，API 可能用多条 filter 或其它枚举；
+# 若 DevTools 里出现非 8/12 的 value，请把结果补进本文件。

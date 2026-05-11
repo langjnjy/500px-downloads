@@ -1,0 +1,50 @@
+# 批量跑 500px userSearch 组合（scripts/run_500px_photographer_filter_batches.py）
+# 启动时若存在本文件则自动加载；可用 --config PATH / --no-config 覆盖。
+# 命令行显式传入的参数会覆盖此处同名字段。
+
+version: 1
+
+# multiselect：按 filter_ids_yaml 做 specialty×member 幂集组合
+# batches_yaml / runs：手写 runs 列表（见 config/500px_usersearch_filter_batches.example.yaml）
+mode: multiselect
+
+multiselect:
+  filter_ids_yaml: config/500px_usersearch_filter_ids.yaml
+  # 组合键含 sort（由下方 fetch_extra_args 的 --sort / --no-sort 推断，默认 RELEVANCE）。
+  # 旧库仅有 s:|m: 的记录在 RELEVANCE 下仍算已跑；换 MOST_POPULAR 等会重新跑同一 filters。
+  combo_seen_db: output/500px_multiselect_combo_seen.sqlite
+  # false：保留「专业为空且会员为空」这一组合（全维允许不选）；true 则与旧脚本默认一致
+  exclude_both_empty_combo: false
+
+batches_yaml:
+  path: config/500px_usersearch_filter_batches.example.yaml
+
+output: output/500px_photographers_all_usernames.txt
+
+limits:
+  max_pages: 50
+  max_batches: 0
+  combo_offset: 0
+
+# 传给 fetch_500px_photographers_all.py 的额外 argv（逐参数一项）
+fetch_extra_args:
+  - --cookies
+  - config/500px_cookies.txt
+  - --sleep
+  - "0.35"
+  - --sort
+  - RELEVANCE          # 排序：RELEVANCE / MOST_POPULAR / MOST_RECENT
+
+# fetch_extra_args:
+#   - --cookies
+#   - config/500px_cookies.txt
+#   - --sleep
+#   - "0.35"
+#   - --sort
+#   - MOST_POPULAR          # 排序：RELEVANCE / MOST_POPULAR / MOST_RECENT
+#   - --page-size
+#   - "200"
+#   - --max-no-progress-pages
+#   - "5"
+
+dry_run: false

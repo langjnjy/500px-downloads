@@ -1,0 +1,90 @@
+# 默认配置（未传 -config 时由 cmd/download 解析到此文件）：面向本仓库 unsplash_downloads，
+# 与 scripts/crawl_unsplash.py / output/media、output/metadata/{date}.metadata.jsonl 对齐。
+# ~/.aws/config 中 [profile aws-s3] 为 region=us-west-2；本机只做本地下载时保持 source_s3 / metadata_sync / s3 均为 enabled:false，不向 S3 拉取或推送。
+# 仓库根目录：./go-downloader/download
+#
+# include_categories 仅第一项参与路径占位 {category}；模板未使用 {category} 时仅占位兼容 Go 合并逻辑。
+
+project_root: "."
+
+include_categories:
+  - unsplash
+exclude_categories: []
+
+# URL 输入：每行一个直链（可与爬虫管线并行时改用 urls_delta_dir_template 下的 shard）
+urls_path_template: "output/urls/urls.txt"
+urls_delta_dir_template: "output/urls/delta"
+pipeline_root: "output"
+
+media_dir_template: "output/media"
+metadata_daily_path_template: "output/metadata/{date}.metadata.jsonl"
+metadata_glob_path_template: "output/metadata/glob/metadata.jsonl"
+
+metadata_bloom_enable: true
+metadata_bloom_bits: 7200000000
+metadata_bloom_hashes: 10
+metadata_bloom_flush_sec: 60
+metadata_bloom_path_template: "output/metadata/seen/metadata.bloom"
+
+metadata_seen_db_enable: true
+metadata_seen_db_path_template: "output/metadata/seen/seen.db"
+
+download:
+  workers: 48
+  retries: 3
+  timeout_sec: 120
+  skip_suffixes: [".m3u8", ".mp4"]
+  use_user_agents: true
+  http_user_agent: ""
+  http_pool_maxsize: 64
+  progress_interval_sec: 600
+  disk_glob_fallback: true
+  metadata_flush_every: 5000
+  metadata_flush_interval_sec: 15
+  loop: false
+  loop_idle_poll_seconds: 600
+  retry_failed: false
+  checkpoint_interval_lines: 50000
+  checkpoint_path_template: "output/checkpoints/download.ckpt"
+  failed_urls_path_template: "output/failed/failed_urls.txt"
+
+# 从 S3 拉 delta：关闭（仅用本地 output/urls）
+source_s3:
+  enabled: false
+  profile: "aws-s3"
+  region_name: "us-west-2"
+  bucket: "nobodies-ai-data"
+  key_prefix: ""
+  pull_retry: 3
+  verify_head: true
+  pull_scheduler_enable: false
+  pull_time_utc: "00:15"
+  pull_scheduler_interval_sec: 120
+
+# metadata 上传 S3：关闭（与 Python upload 脚本需要时再各自启用）
+metadata_sync:
+  enabled: false
+  time_utc: "00:05"
+  interval_sec: 0
+  retry: 3
+  key_prefix: "metadata/photo-download"
+  extract_config_path: ""
+
+# 媒体直传 S3：关闭（不上传、不删本地；与 profile region 一致便于日后开启）
+s3:
+  enabled: false
+  profile: "aws-s3"
+  region_name: "us-west-2"
+  bucket: "nobodies-ai-data"
+  key_prefix: "photo-download"
+  delete_after_upload: true
+  delete_metadata_after_upload: false
+  upload_workers: 8
+  pending_max_files: 10000
+  pending_max_bytes_mb: 12000
+  upload_retries: 3
+  upload_retry_base_sec: 0.5
+  upload_retry_max_sec: 60
+  cli_connect_timeout_sec: 60
+  cli_read_timeout_sec: 300
+  dry_run: false

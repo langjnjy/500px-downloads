@@ -1,0 +1,35 @@
+# userSearch 的 GraphQL 变量 sort（类型 UserSort）。
+# 本仓库 fetch 脚本允许的取值见 scripts/fetch_500px_photographers_all.py 中的 USER_SORT_CHOICES。
+# 若服务端日后扩展枚举，需以 GraphQL 报错/校验为准，并同步更新脚本 choices。
+#
+# 使用方式示例：
+#   python3 scripts/fetch_500px_photographers_all.py --sort MOST_POPULAR ...
+#   run 批量时在 fetch_extra_args 里追加一项：--sort MOST_RECENT
+#
+# 站点 photographers/all 下拉常见文案对应（便于肉眼对照）：
+# - 「Most followers」≈ MOST_POPULAR
+# - 「Recency」≈ MOST_RECENT
+# - 未指定或与默认列表对齐时常用 RELEVANCE（脚本默认值）
+
+version: 1
+
+graphql_enum: UserSort
+
+sort_values:
+  - value: RELEVANCE
+    fetch_cli_flag: "--sort RELEVANCE"
+    notes_zh: 相关度；fetch 默认（未使用 --no-sort 时）
+
+  - value: MOST_POPULAR
+    fetch_cli_flag: "--sort MOST_POPULAR"
+    notes_zh: 站点 UI 常标为 Most followers（粉丝/热度类排序）
+
+  - value: MOST_RECENT
+    fetch_cli_flag: "--sort MOST_RECENT"
+    notes_zh: 站点 UI 常标为 Recency（新近类排序）
+
+# 特殊：不传枚举（仅试验 / 对照服务端行为）
+no_sort:
+  fetch_cli_flag: "--no-sort"
+  graphql_variable: null
+  notes_zh: GraphQL 变量 sort=null；与前述枚举并列时为试验用法

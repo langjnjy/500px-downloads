@@ -1,0 +1,30 @@
+# gallery-dl 用户发现脚本配置（scripts/discover_500px_users_gallery_dl.py）
+# 若存在本文件，启动时自动加载；可用 --config PATH / --no-config 覆盖。
+# 命令行显式传入的参数会覆盖此处同名字段。
+
+version: 1
+
+cookies: config/500px_cookies.txt
+seeds_file: seeds.txt
+output: output/500px_discovered_gallery_dl_usernames.txt
+
+# 每个种子用户 gallery-dl --range 1-N；0 表示不设 range（拉取全部，慎用）
+max_per_user: 80
+
+# 种子之间的休眠秒数
+sleep: 0.5
+
+# gallery-dl 可执行文件路径；留空或 "gallery-dl" 则从 PATH / ~/.local/bin 解析
+gallery_dl_path: gallery-dl
+
+# 单次 subprocess 调用 gallery-dl 的超时秒数
+gallery_dl_timeout_seconds: 600
+
+# SQLite 去重（px500_discovered_users）；设为 null 则不使用
+seen_db: output/gallery_dl_discover_seen.sqlite
+
+# true 则覆盖写入 output；false 则追加，并与已有行去重
+overwrite_output: false
+
+# 每处理多少个种子打印一行进度
+progress_every: 10
