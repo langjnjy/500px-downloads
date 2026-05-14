@@ -1,0 +1,16 @@
+# scripts/extract_500px_usernames_from_saved_html.py 默认配置
+# 用法: python3 scripts/extract_500px_usernames_from_saved_html.py [--config 本文件]
+
+version: 1
+
+# 合并写入的用户名清单（相对仓库根目录，也可用绝对路径）
+output: output/500px_photographers_all_usernames.txt
+
+# true: 只把「尚不存在」的新 uid 追加到文件末尾
+# false: 与现有文件并集后按字典序重写整文件
+append_only: true
+
+# 要扫描的 HTML 路径（相对仓库根）；支持 glob，加引号避免 shell 展开
+inputs:
+  - output/html/popular_checkpoint.html
+  # - "output/html/popular_abstract_*.html"

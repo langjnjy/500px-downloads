@@ -1,0 +1,91 @@
+# scripts/save_500px_scroll_html.py 默认配置
+# 依赖（Debian/Ubuntu 推荐）:
+#   sudo apt install python3-selenium python3-yaml chromium-chromedriver
+# （或安装与 google-chrome 主版本一致的 chromedriver；避免仅装浏览器无 driver）
+# 若 pip 报 externally-managed-environment，见脚本顶部说明（apt / --break-system-packages / pipx）
+# 用法: python3 scripts/save_500px_scroll_html.py [--config 本文件]
+
+version: 1
+
+browser:
+  # true=有界面（需 DISPLAY）；无图形环境请改为 false 或设环境变量 AUTO_HEADLESS=1
+  headed: true
+  window_width: 1400
+  window_height: 900
+  # 留空则 Selenium Manager 自动匹配本机 Chrome；也可写绝对路径如 /usr/bin/google-chrome
+  chrome_binary: ""
+  # chromedriver 可执行文件；留空则试 CHROMEDRIVER_PATH、PATH、/usr/bin/chromedriver 等（解决 NoSuchDriverException）
+  chromedriver_binary: ""
+  # 登录态 A：Netscape cookies.txt（与 fetch_500px_photographers_all.py --cookies 相同）。
+  # 留空 = 不注入 = 匿名访问。要登录请填路径，例如:
+  #   cookies_file: config/500px_cookies.txt
+  # 并确保该文件存在（用已登录 500px 的 Chrome 导出 Netscape 格式）。
+  # 路径相对仓库根；也可用绝对路径如 /home/ubuntu/500px-downloads/config/500px_cookies.txt
+  cookies_file: "config/500px_cookies.txt"
+  # 注入 cookie 后是否 refresh 落地页（有助于 SPA 读到会话）
+  cookies_after_inject_refresh: true
+  # 注入 cookie 前先打开的 URL（须与 cookie domain 同站）
+  cookies_landing_url: "https://500px.com/"
+  # 登录态 B：Chrome 用户数据目录（等于用日常浏览器 profile）。须先完全退出正在用该目录的 Chrome。
+  # user_data_dir: "/home/YOU/.config/google-chrome"
+  # profile_directory: "Default"
+  user_data_dir: ""
+  profile_directory: "Default"
+  # normal=等 document 完全加载（SPA 易长时间卡住）；eager=DOM 就绪即返回（推荐）；none=立即返回
+  page_load_strategy: eager
+  page_load_wait_sec: 5
+  # execute_script（含「是否到底」检测）最大运行秒数；500px 大 DOM 易超时，建议 ≥120
+  script_timeout_sec: 180
+
+scroll:
+  # 每次滚动的像素（向下）
+  pixels: 900
+  # 每次滚动后等待 DOM/请求（秒）；与 long_wait_sec 不同（后者仅在接近页底且 metric 不涨时触发）
+  pause_sec: 0.2
+  # long_retry：未到底只按 pause_sec 连续滑；到底且 metric 不涨才进入长等（见 long_wait_sec / long_wait_cycles）
+  stall_strategy: long_retry
+  # 仅 stall_strategy=quick 时生效：连续多少次「pause_sec 后 metric 未增」即退出
+  stall_threshold: 3
+  # long_retry：metric 未增时，是否仅在「视窗已接近文档底部」时才进入 long_wait_sec（推荐 true）
+  long_wait_only_when_at_bottom: true
+  # 判定接近底部的像素容差（距文档底小于约此值视为 window 已到底）
+  bottom_epsilon_px: 100
+  # 内部可滚容器：scrollHeight 比 clientHeight 至少大这么多像素才参与判断（过滤无关小滚动区）
+  inner_scroll_min_overflow_px: 120
+  # 自 body 起 DFS 最多检查多少个元素节点；超出则视为未到底（避免 script timeout）
+  inner_scroll_max_nodes: 8000
+  # 仅 long_retry 且已到底：每次长等秒数（此阶段不再下滑，只 sleep 后读 metric）
+  long_wait_sec: 30
+  # 仅 long_retry 且 long_wait_only_when_at_bottom：已到底且 metric 不涨时，「先等 long_wait_sec 再读 metric」重复几次后仍不涨则结束（默认 3）
+  long_wait_cycles: 3
+  # 最多下滑次数（每次 execute_script 算 1 次；长等后的重试也算 1 次）。
+  # 设为 0 或负数 = 不限制，仅靠「无新内容」逻辑结束（若页面无限增长则可能极久）。
+  max_rounds: 0
+  # 每累计多少次「下滑」（execute_script 计数）将当前 page_source 写入 checkpoint；0=关闭；默认 100
+  # 例: 100 表示第 100、200… 次下滑后各写一次（覆盖同一 checkpoint_file）
+  checkpoint_every_rounds: 100
+  # 若为 true：每次 checkpoint HTML 落盘后，立即按 extract_config 从该文件提取 uid 并合并写入清单
+  # （与手动运行 scripts/extract_500px_usernames_from_saved_html.py 相同；append_only 时只追加新行，tab crash 不丢已合并数据）
+  checkpoint_extract: true
+  # 供 checkpoint_extract 使用的 YAML（含 output、append_only）
+  extract_config: config/extract_500px_usernames_from_saved_html.yaml
+  # 相对 output.dir；{slug} 替换为当前 url 的 slug；同一文件反复覆盖
+  checkpoint_file: "{slug}_checkpoint.html"
+  # 用页面内指向 /photo/ 的链接数量作为「是否有新内容」的指标
+  metric: photo_links
+
+output:
+  # 相对仓库根目录；会 mkdir -p
+  dir: output/html
+  # 文件名: {slug}_{timestamp}.html；若 false 则 {slug}.html（后者可能覆盖）
+  filename_timestamp: true
+
+urls:
+  # - url: "https://500px.com/popular?category=Abstract"
+  #   slug: popular_abstract
+  - url: "https://500px.com/popular"
+    slug: popular
+  # - url: "https://500px.com/fresh"
+  #   slug: fresh
+  # - url: "https://500px.com/upcoming"
+  #   slug: upcoming

@@ -8,8 +8,9 @@
   多进程同时以追加模式写同一 ``--output`` 时，在 Linux 下通常为逐行小写入，一般可接受；仍需离线去重。
 - ``combo_seen_db`` 的组合键含 **sort**（由 ``fetch_extra_args`` 里的 ``--sort`` / ``--no-sort`` 推断，默认 RELEVANCE）。
   旧库仅有 ``s:|m:`` 的行在 **RELEVANCE** 下仍视为已见，避免重复跑历史数据。
-- ``--multiselect-combos-from-yaml``：从 filter id YAML 读 specialty / member id，
-  生成 **网页多选语义** 下的所有组合：specialty 子集 × member 子集（member 仅使用 id≠0 的项；空子集=不在请求里加该维 filter）。
+- ``--multiselect-combos-from-yaml``：从 filter id YAML 读 specialty / member id。
+  - 默认 ``selection_mode: powerset``：**网页多选语义** specialty 子集 × member 子集（member 仅 id≠0；空子集=不加该维 filter）。排序由 ``fetch_extra_args`` 的 ``--sort`` / ``--no-sort`` 固定一条。
+  - ``selection_mode: radio``：**各维至多勾选一个**（specialty 不选或单 id；member 不选或单 id）× ``sort_modes`` 穷举（默认三种 RELEVANCE / MOST_POPULAR / MOST_RECENT）；此时会忽略 ``fetch_extra_args`` 里的 ``--sort`` / ``--no-sort``，按每条组合注入 ``--sort``。
   默认 **包含**「两维都不选」的组合；若需与旧行为一致可 ``--exclude-both-empty-combo``。
 
   python3 scripts/run_500px_photographer_filter_batches.py
@@ -48,6 +49,9 @@ import yaml
 
 
 DEFAULT_RUN_CONFIG_RELPATH = "config/run_500px_photographer_filter_batches.yaml"
+
+# 须与 scripts/fetch_500px_photographers_all.py 中 USER_SORT_CHOICES 一致（radio 的 sort_modes）
+FETCH_USER_SORT_CHOICES: Tuple[str, ...] = ("RELEVANCE", "MOST_POPULAR", "MOST_RECENT")
 
 LOG_DIR_RELPATH = "output/logs"
 LOG_FILE_PREFIX = "photographers_filter_batches"
@@ -194,6 +198,20 @@ def _defaults_and_fetch_extra_from_run_config(
         excl = cfg.get("exclude_both_empty_combo", False)
     out["exclude_both_empty_combo"] = bool(excl)
     out["dry_run"] = bool(cfg.get("dry_run", False))
+
+    sel = ms.get("selection_mode")
+    if isinstance(sel, str) and sel.strip():
+        out["multiselect_selection_mode"] = sel.strip().lower()
+    else:
+        out["multiselect_selection_mode"] = "powerset"
+    sms = ms.get("sort_modes")
+    if isinstance(sms, list) and sms:
+        parsed_sm = [str(x).strip().upper() for x in sms if str(x).strip()]
+        out["multiselect_sort_modes"] = (
+            parsed_sm if parsed_sm else list(FETCH_USER_SORT_CHOICES)
+        )
+    else:
+        out["multiselect_sort_modes"] = list(FETCH_USER_SORT_CHOICES)
 
     return out, fetch_extra
 
@@ -372,6 +390,91 @@ def _estimate_combo_count(n_spec: int, n_mem: int, exclude_both_empty: bool) -> 
     return total
 
 
+def _estimate_radio_combo_count(
+    n_spec: int, n_mem: int, n_sorts: int, exclude_both_empty: bool
+) -> int:
+    """specialty / member 各「不选或单选」× 若干 sort。"""
+    total = (1 + n_spec) * (1 + n_mem) * n_sorts
+    if exclude_both_empty:
+        total -= n_sorts
+    return total
+
+
+def _strip_sort_flags_from_argv(argv: Sequence[str]) -> List[str]:
+    """去掉 ``--sort`` / ``--sort=`` / ``--no-sort``，供 radio 模式按条注入排序。"""
+    out: List[str] = []
+    i = 0
+    av = list(argv)
+    while i < len(av):
+        a = av[i]
+        if a == "--no-sort":
+            i += 1
+            continue
+        if a == "--sort":
+            i += 2
+            continue
+        if a.startswith("--sort="):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def _fetch_argv_for_sort_signature(
+    base_tail: Sequence[str], sort_sig: str
+) -> List[str]:
+    """在去掉原排序 flag 后，按 ``sort_sig`` 追加 ``--sort`` 或 ``--no-sort``。"""
+    stripped = _strip_sort_flags_from_argv(base_tail)
+    if sort_sig == "null":
+        return list(stripped) + ["--no-sort"]
+    return list(stripped) + ["--sort", sort_sig]
+
+
+def _iter_radio_multiselect_runs(
+    spec_ids: Sequence[str],
+    mem_ids: Sequence[str],
+    sort_sigs: Sequence[str],
+    *,
+    exclude_both_empty: bool,
+) -> Iterator[Tuple[Tuple[str, ...], Tuple[str, ...], str]]:
+    """各维至多一个 id；sort 维穷举 ``sort_sigs``。"""
+    spec_choices: List[Tuple[str, ...]] = [tuple()]
+    spec_choices.extend((s,) for s in spec_ids)
+    mem_choices: List[Tuple[str, ...]] = [tuple()]
+    mem_choices.extend((m,) for m in mem_ids)
+    for ss, ms in itertools.product(spec_choices, mem_choices):
+        if exclude_both_empty and not ss and not ms:
+            continue
+        for sg in sort_sigs:
+            yield ss, ms, sg
+
+
+def _iter_multiselect_combo_runs_with_sort(
+    spec_ids: Sequence[str],
+    mem_ids: Sequence[str],
+    *,
+    selection_mode: str,
+    exclude_both_empty: bool,
+    sort_modes: Sequence[str],
+    fixed_sort_sig: str,
+) -> Iterator[Tuple[Tuple[str, ...], Tuple[str, ...], str]]:
+    if selection_mode == "radio":
+        yield from _iter_radio_multiselect_runs(
+            spec_ids,
+            mem_ids,
+            sort_modes,
+            exclude_both_empty=exclude_both_empty,
+        )
+        return
+    for ss, ms in _iter_multiselect_combo_runs(
+        spec_ids,
+        mem_ids,
+        exclude_both_empty=exclude_both_empty,
+    ):
+        yield ss, ms, fixed_sort_sig
+
+
 def _run_fetch_subprocess(cmd: Sequence[str], cwd: str) -> subprocess.CompletedProcess:
     return subprocess.run(list(cmd), cwd=cwd)
 
@@ -442,6 +545,16 @@ def main() -> int:
         "--exclude-both-empty-combo",
         action="store_true",
         help="排除「不加 SPECIALTIES 且不加 MEMBER_TYPE」的组合（与旧版默认一致）",
+    )
+    ap.add_argument(
+        "--multiselect-selection-mode",
+        dest="multiselect_selection_mode",
+        choices=("powerset", "radio"),
+        default="powerset",
+        help=(
+            "多选语义：powerset= specialty/member 子集笛卡尔积（默认）；"
+            "radio= 各维至多一个 id × sort_modes 穷举"
+        ),
     )
     ap.add_argument(
         "--max-batches",
@@ -532,19 +645,61 @@ def main() -> int:
             log.error("%s 中无 specialties.id", id_path)
             print(f"{id_path} 中无 specialties.id", file=sys.stderr)
             return 2
-        est = _estimate_combo_count(
-            len(spec_ids), len(mem_ids), args.exclude_both_empty_combo
-        )
+
+        selection_mode = str(
+            getattr(args, "multiselect_selection_mode", "powerset") or "powerset"
+        ).strip().lower()
+        if selection_mode not in ("powerset", "radio"):
+            selection_mode = "powerset"
+        args.multiselect_selection_mode = selection_mode
+
+        raw_sort_modes = getattr(args, "multiselect_sort_modes", None)
+        if not isinstance(raw_sort_modes, list) or not raw_sort_modes:
+            sort_modes = list(FETCH_USER_SORT_CHOICES)
+        else:
+            sort_modes = [str(x).strip().upper() for x in raw_sort_modes if str(x).strip()]
+        if not sort_modes:
+            sort_modes = list(FETCH_USER_SORT_CHOICES)
+        if selection_mode == "radio":
+            for sm in sort_modes:
+                if sm not in FETCH_USER_SORT_CHOICES:
+                    log.error(
+                        "非法 sort_modes 项: %r（须为 %s 之一）",
+                        sm,
+                        ", ".join(FETCH_USER_SORT_CHOICES),
+                    )
+                    print(
+                        f"非法 sort_modes: {sm!r}（须为 {list(FETCH_USER_SORT_CHOICES)}）",
+                        file=sys.stderr,
+                    )
+                    return 2
+
+        fixed_sort_sig = _usersearch_sort_signature(extra_tail)
+        if selection_mode == "radio":
+            est = _estimate_radio_combo_count(
+                len(spec_ids),
+                len(mem_ids),
+                len(sort_modes),
+                args.exclude_both_empty_combo,
+            )
+            sort_desc = "+".join(sort_modes)
+        else:
+            est = _estimate_combo_count(
+                len(spec_ids), len(mem_ids), args.exclude_both_empty_combo
+            )
+            sort_desc = fixed_sort_sig
+
         log.info(
-            "多选 specialties=%d member_types=%d 理论批次≈%d sort=%s id_yaml=%s",
+            "多选 mode=%s specialties=%d member_types=%d 理论批次≈%d sort=%s id_yaml=%s",
+            selection_mode,
             len(spec_ids),
             len(mem_ids),
             est,
-            combo_sort_sig,
+            sort_desc,
             id_path,
         )
         print(
-            f"多选 理论批次≈{est} sort={combo_sort_sig}（详情见日志）",
+            f"多选 mode={selection_mode} 理论批次≈{est} sort={sort_desc}（详情见日志）",
             flush=True,
         )
 
@@ -558,7 +713,12 @@ def main() -> int:
             )
             seen_conn = _open_combo_seen_db(seen_path)
             n_seen = _combo_seen_count(seen_conn)
-            log.info("combo_seen_db=%s 已有=%d sort=%s", seen_path, n_seen, combo_sort_sig)
+            log.info(
+                "combo_seen_db=%s 已有=%d sort_keys=%s",
+                seen_path,
+                n_seen,
+                sort_desc,
+            )
             print(f"combo_seen 已有 {n_seen} 条", flush=True)
         elif args.max_batches == 0 and est > 50_000:
             warn = (
@@ -573,10 +733,13 @@ def main() -> int:
         skipped_seen = 0
         ran_ok = 0
 
-        combo_iter = _iter_multiselect_combo_runs(
+        combo_iter = _iter_multiselect_combo_runs_with_sort(
             spec_ids,
             mem_ids,
+            selection_mode=selection_mode,
             exclude_both_empty=args.exclude_both_empty_combo,
+            sort_modes=sort_modes,
+            fixed_sort_sig=fixed_sort_sig,
         )
 
         workers_n = max(1, int(args.workers))
@@ -590,7 +753,7 @@ def main() -> int:
 
         try:
             try:
-                for idx, (ss, ms) in enumerate(combo_iter):
+                for idx, (ss, ms, sort_sig) in enumerate(combo_iter):
                     if early_exit != 0:
                         break
                     if skip_leading > 0:
@@ -601,8 +764,8 @@ def main() -> int:
                     slots_in_window += 1
 
                     filter_key = _combo_filter_key(ss, ms)
-                    combo_key = _combo_stable_key(ss, ms, combo_sort_sig)
-                    legacy_key = filter_key if combo_sort_sig == "RELEVANCE" else None
+                    combo_key = _combo_stable_key(ss, ms, sort_sig)
+                    legacy_key = filter_key if sort_sig == "RELEVANCE" else None
                     name = _combo_run_name(ss, ms, idx)
                     filters = _filters_from_combo(ss, ms)
 
@@ -625,7 +788,7 @@ def main() -> int:
                         fetch_script=fetch_script,
                         out=out,
                         filters=filters,
-                        extra_tail=extra_tail,
+                        extra_tail=_fetch_argv_for_sort_signature(extra_tail, sort_sig),
                         max_pages_args=max_pages_args,
                     )
 
