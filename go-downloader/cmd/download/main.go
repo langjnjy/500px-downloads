@@ -71,7 +71,7 @@ func openSessionLog(projectRoot string) (*sessionLog, error) {
 }
 
 var (
-	configPath = flag.String("config", "", "配置文件路径；未指定时优先选用 go-downloader/config/download-http.yaml（在仓库根目录运行时），其次为同目录下 config/download-http.yaml、再为仓库根 config/download.yaml（兼容旧布局）")
+	configPath = flag.String("config", "", "配置文件路径；未指定时优先 go-downloader/config/download-500px.yaml（若存在），否则 download-http.yaml 等同路径")
 )
 
 func main() {
@@ -81,16 +81,16 @@ func main() {
 	configFile := *configPath
 	if configFile == "" {
 		exeDir := filepath.Dir(os.Args[0])
-		// go-downloader 默认使用本模块下的 download-http.yaml（与仓库根 config/download.yaml 解耦）
+		// 本仓库优先 download-500px.yaml；否则与历史一致使用 download-http.yaml
 		possiblePaths := []string{
-			"go-downloader/config/download-http.yaml", // 当前目录为仓库根
-			"config/download-http.yaml",               // 当前目录为 go-downloader
-			filepath.Join(exeDir, "../config/download-http.yaml"), // 二进制在 go-downloader/cmd/download 等
-			filepath.Join(exeDir, "config/download-http.yaml"),    // 二进制放在 go-downloader/ 下
-			// 兼容：仅存在旧配置时仍可读仓库根 config/download.yaml
-			"config/download.yaml",
-			"go-downloader/config/download.yaml",
-			filepath.Join(exeDir, "../config/download.yaml"),
+			"go-downloader/config/download-500px.yaml",
+			"config/download-500px.yaml",
+			filepath.Join(exeDir, "../config/download-500px.yaml"),
+			filepath.Join(exeDir, "config/download-500px.yaml"),
+			"go-downloader/config/download-http.yaml",
+			"config/download-http.yaml",
+			filepath.Join(exeDir, "../config/download-http.yaml"),
+			filepath.Join(exeDir, "config/download-http.yaml"),
 		}
 		for _, path := range possiblePaths {
 			if _, err := os.Stat(path); err == nil {
@@ -99,7 +99,7 @@ func main() {
 			}
 		}
 		if configFile == "" {
-			configFile = "go-downloader/config/download-http.yaml"
+			configFile = "go-downloader/config/download-500px.yaml"
 		}
 	}
 

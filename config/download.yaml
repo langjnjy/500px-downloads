@@ -1,0 +1,79 @@
+# scripts/download.py：并发 gallery-dl 下载 500px 用户主页作品，写入按日 metadata JSONL；
+# 成功用户写入 SQLite seen；失败写入 JSONL 便于重试。
+# 运行日志：{root}/output/logs/download_500px_{UTC时间戳}Z_{pid}.log
+#
+# 本机落盘（与下述绝对路径一致；其他机器请改 root 或相对路径）：
+# - gallery-dl -d 直接指向 {root}/output/media/；500px 会先落在 output/media/500px/<用户>/，
+#   materialize 成功后平铺为 output/media/<sha1>.<ext> 并删除 500px/ 中转目录。
+# - 元数据 JSONL 先写在 {root}/output/metadata_tmp/{UTC日期}.metadata.jsonl（确认后可迁移到
+#   output/metadata 或整目录删除）；改 metadata_dir 即可换路径。
+
+root: "/home/ubuntu/500px-downloads"
+
+gallery_dl_bin: gallery-dl
+
+# 并发 worker = 同时 gallery-dl 子进程数（默认 48；有 Cookie 时仍注意别压垮本机或触发限流）
+workers: 12
+
+# 500px GraphQL 未登录常 403；使用本机浏览器已登录 500px.com 的 Cookie（gallery-dl --cookies-from-browser）。
+# 格式：BROWSER[/DOMAIN]…，见 `gallery-dl --help`；无头/CI 可改 false 并改用 cookies_file。
+#
+use_cookies: false
+# use_cookies: true
+# cookies_from_browser: chrome/500px.com
+# cookies_file: config/500px_cookies.txt
+
+# 为 true 时从 proxies_file 读代理列表；每个用户任务（dump-json + 下载）共用顺序分配的下一个代理，250 条用完后回到第 1 条。
+use_proxies: true
+proxies_file: config/proxies.yaml
+
+gallery_dl_retries: 3
+http_timeout: 120.0
+sleep_429: 60.0
+sleep_retries: "exp=2.0"
+
+gallery_dl_job_timeout_sec: 0
+
+dest_base: tmp/download_500px_users
+
+# crawl_hash：下载根目录即 output/media（非 tmp）；final_media_dir 与之一致时平铺仍在同目录。
+gallery_dl_dest: "output/media"
+final_media_dir: "/home/ubuntu/500px-downloads/output/media"
+metadata_dir: "output/metadata_tmp"
+
+# metadata_source:
+#   dump_json — 先 --dump-json 再下载（两次 gallery-dl）；500px 用户集推荐。
+#   sidecar — 只跑一次下载再读 *.json；500px 的 --write-info-json 多为单文件 info.json，无法覆盖每张图，
+#             会导致 output/media 为空、output/media/500px 下堆满未平铺文件，勿对 500px 用户集使用。
+metadata_source: dump_json
+
+gallery_dl_filename_format: "{id}.{extension}"
+
+gallery_dl_extra_args: []
+
+image_key_style: crawl_hash
+image_key_prefix: 500px-downloads/media
+
+# 单边为 0 表示该边不参与比较（不过滤分辨率）
+min_short: 0
+min_long: 0
+
+# 一行一个 uid（如 daniel_gastager）或完整 https://500px.com/p/<uid>
+profile_urls_file: output/500px_photographers_all_usernames.txt
+
+profile_urls: []
+
+profiles_seen_db: output/state/gallery_dl_500px_user_profiles_seen.db
+seen_db_synchronous: NORMAL
+
+failed_profiles_log: output/state/gallery_dl_500px_user_profiles_failed.jsonl
+
+skip_completed_profiles: true
+
+retry_failed_only: false
+
+metadata_flush_every_n_lines: 200
+metadata_flush_interval_sec: 3.0
+metadata_flush_after_each_profile: true
+
+download_stats_interval_sec: 600

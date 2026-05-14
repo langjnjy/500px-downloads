@@ -1,0 +1,44 @@
+# 500px-downloads：扁平扫描 output/media，上传至 s3://nobodies-ai-data/500px-downloads/media/<相对路径>
+# 本批成功上传后，将 output/metadata/*.metadata.jsonl 中 basename 匹配的行的 image_key 重写为 metadata_image_key_prefix/basename。
+#
+# 默认常驻 loop=true；until_empty 仅在 loop=false 时生效。
+
+output_dir: "../output"
+downloads_dir: "downloads"
+pipeline_root_dir: "pipeline"
+metadata_dir: "../output/metadata"
+
+# 与 wasabi.key_prefix 一致；用于重写 JSONL 的 image_key（500px-downloads/media/<文件名>）
+metadata_image_key_prefix: "500px-downloads/media"
+
+wasabi:
+  enabled: true
+  profile: "aws-s3"
+  bucket: "nobodies-ai-data"
+  region_name: "us-west-2"
+  key_prefix: "500px-downloads/media"
+
+  # 并发上传；提高时请同步加大 max_queue_size、max_pool_connections（见下行注释）
+  upload_workers: 80
+  # 建议 >= workers×4，loop 扫描入队时避免 Walk 长时间阻塞在满 channel
+  max_queue_size: 640
+  # 建议 >= workers：与 uploader HTTP Transport 的 MaxIdleConnsPerHost 一致，避免连接池过小拖慢并发
+  max_pool_connections: 80
+
+  delete_after_upload: true
+
+  upload_retries: 3
+  upload_retry_base_sec: 0.5
+  upload_retry_max_sec: 60
+  sdk_connect_timeout_sec: 60
+  sdk_read_timeout_sec: 300
+
+upload:
+  dry_run: false
+  scan_root: "/home/ubuntu/500px-downloads/output/media"
+  discover_categories: false
+  loop: true
+  until_empty: true
+  poll_seconds: 60
+  idle_poll_seconds: 300
+  report_seconds: 30

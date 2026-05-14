@@ -403,7 +403,7 @@ def main() -> int:
     log.info("启动 argv=%s", sys.argv)
 
     fetch_script = root / "scripts" / "fetch_500px_photographers_all.py"
-    default_batches = root / "config" / "500px_usersearch_filter_batches.example.yaml"
+    default_batches = root / "config" / "500px_usersearch_filter_batches.yaml"
 
     try:
         no_config, cfg_override, argv_rest = _extract_config_cli(sys.argv[1:])

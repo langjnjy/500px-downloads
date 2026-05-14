@@ -37,7 +37,7 @@
     若需运行中去重且不占内存，可用 ``--seen-db``（SQLite）。
   - **扩大覆盖面 / 绕过「全站列表」第 51 页搜索 500**：对 ``userSearch`` 加 ``filters``（如 ``SPECIALTIES``、``MEMBER_TYPE``）。
     界面上的英文类别名需对应 **数字 ID**（可用 DevTools 看 GraphQL variables，或参考
-    ``config/500px_usersearch_filter_batches.example.yaml`` 里的探测表）。单桶 ``totalCount`` 较小时，
+    ``config/500px_usersearch_filter_batches.yaml`` 里的探测表）。单桶 ``totalCount`` 较小时，
     分页页数少，往往不会触发深分页 bug；最终对各桶结果 **并集去重** 可接近「更多不重复用户」。
 """
 

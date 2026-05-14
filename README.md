@@ -9,12 +9,13 @@
 ```
 500px-downloads/
 ├── config/
+│   ├── download.yaml                          # gallery-dl 用户作品批量下载（scripts/download.py）
 │   ├── 500px_cookies.txt                      # Netscape Cookie（勿提交到 git；可用 export 脚本生成）
 │   ├── 500px_usersearch_filter_ids.yaml       # 过滤维度 id 与探测统计
-│   ├── 500px_usersearch_filter_batches.yaml   # 批量任务定义（自行维护）
-│   ├── 500px_usersearch_filter_batches.example.yaml
+│   ├── 500px_usersearch_filter_batches.yaml   # 批量任务定义（runs 列表）
 │   └── discover_500px_users_gallery_dl.yaml   # gallery-dl 用户发现脚本默认配置
 ├── scripts/
+│   ├── download.py                            # gallery-dl 并发下载用户主页 + metadata / seen DB
 │   ├── fetch_500px_photographers_all.py       # photographers/all 对应 userSearch 分页
 │   ├── run_500px_photographer_filter_batches.py  # 多组 filter 批量调用上一脚本
 │   ├── discover_500px_users_gallery_dl.py     # gallery-dl 拉用户作品 JSON 抠用户名
@@ -55,6 +56,9 @@ python3 scripts/fetch_500px_photographers_all.py \
 # 按 YAML 批量多组 filter 追加写入同一输出
 python3 scripts/run_500px_photographer_filter_batches.py \
   --batches-yaml config/500px_usersearch_filter_batches.yaml
+
+# gallery-dl 批量下载用户主页（默认 config/download.yaml）
+python3 scripts/download.py
 ```
 
 ## go-downloader

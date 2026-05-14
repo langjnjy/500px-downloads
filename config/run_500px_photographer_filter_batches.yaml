@@ -5,7 +5,7 @@
 version: 1
 
 # multiselect：按 filter_ids_yaml 做 specialty×member 幂集组合
-# batches_yaml / runs：手写 runs 列表（见 config/500px_usersearch_filter_batches.example.yaml）
+# batches_yaml / runs：手写 runs 列表（见 config/500px_usersearch_filter_batches.yaml）
 mode: multiselect
 
 multiselect:
@@ -17,7 +17,7 @@ multiselect:
   exclude_both_empty_combo: false
 
 batches_yaml:
-  path: config/500px_usersearch_filter_batches.example.yaml
+  path: config/500px_usersearch_filter_batches.yaml
 
 output: output/500px_photographers_all_usernames.txt
 
@@ -34,6 +34,6 @@ fetch_extra_args:
   - --sleep
   - "0.35"
   - --sort
-  - MOST_POPULAR          # 排序：RELEVANCE / MOST_POPULAR / MOST_RECENT
+  - RELEVANCE          # 排序：RELEVANCE / MOST_POPULAR / MOST_RECENT
 
 dry_run: false

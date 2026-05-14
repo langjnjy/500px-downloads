@@ -13,11 +13,13 @@ build/
 
 # 敏感与本地配置（勿提交真实 Cookie）
 config/*cookies*.txt
+config/proxies.yaml
 config/*secret*
 *.pem
 
 # 产出与状态（体积大）
 output/
+tmp/
 *.db
 *.sqlite
 *.jsonl
@@ -29,7 +31,9 @@ output/
 *.swp
 *~
 
-# Go（go-downloader 子模块编译产物）
+# Go（go-downloader / go-uploader 编译产物）
 go-downloader/download
 go-downloader/*.exe
 go-downloader/coverage.out
+go-uploader/uploader
+go-uploader/*.exe

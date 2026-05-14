@@ -1,0 +1,87 @@
+# scripts/extract.py：仅 gallery-dl --dump-json（不下载），按用户写精简 metadata JSONL；成功后 uid 记入 extract 专用 seen DB。
+# 临时 .json 仅在 dump_json_stdout_to_memory: false 时使用。
+
+root: "/home/ubuntu/500px-downloads"
+
+gallery_dl_bin: gallery-dl
+
+# 并发 gallery-dl 子进程数（受代理数、本机 fd、500px 限流约束；过大易 429）
+workers: 32
+
+use_cookies: false
+# cookies_from_browser: chrome/500px.com
+# cookies_file: config/500px_cookies.txt
+
+use_proxies: true
+proxies_file: config/proxies.yaml
+
+gallery_dl_retries: 3
+http_timeout: 120.0
+sleep_429: 60.0
+sleep_retries: "exp=2.0"
+
+# 单用户 dump-json 子进程超时（秒）；0 表示不限制（大作品集可能很久）
+gallery_dl_job_timeout_sec: 0
+
+gallery_dl_extra_args: []
+
+# ---------- 性能相关 ----------
+# true：子进程 stdout 直接进内存再解析（默认，省掉大 JSON 写盘+读盘）
+dump_json_stdout_to_memory: true
+# true 且已 pip install orjson 时用 orjson 解析 dump（大图集约 2～5× 更快）
+extract_use_orjson: true
+
+# 与 download.yaml 一致：分辨率门槛；0 表示该边不限制（不过滤）
+min_short: 0
+min_long: 0
+
+image_key_style: crawl_hash
+image_key_prefix: 500px-downloads/media
+
+# dump_json_stdout_to_memory: false 时写入此目录（成功后删除）
+dump_staging_dir: "output/extract_staging/dumps"
+
+# 按 UTC 日写入：{root}/{metadata_dir}/{UTC日期}.metadata.jsonl → 默认即 output/metadata/
+metadata_dir: "output/metadata"
+
+# metadata 分片（配置缺省时代码也默认分片）：extract_metadata_1.jsonl …
+# 轮转在「当前 uid 已成功 flush 之后」判断：任一条满足即切下一片
+#   - max_shard_lines：默认约 300 万行一片（代码内 _DEFAULT_SHARD_MAX_LINES）；yaml 里写 0 表示不按行数切
+#   - profiles_per_shard：成功用户数上限；0 表示不按用户数切（常与 max_shard_lines 联用）
+#   - max_shard_bytes：0 表示不按体积切
+#   - placeholder_max_lines：认为「下一片」为占位的最大行数（见代码）；0 关闭占位回退
+# state_file 记录当前分片与计数，便于重启续跑；启动时会用当前分片文件换行数与 state 对齐
+# image_key 去重会扫描 meta_dir 下所有 extract_metadata_<n>.jsonl
+# 若需恢复旧行为（单日单文件 {UTC日期}.metadata.jsonl），设 extract_metadata_sharding.enabled: false
+extract_metadata_sharding:
+  enabled: true
+  filename_template: "extract_metadata_{shard}.jsonl"
+  profiles_per_shard: 0
+  max_shard_bytes: 0
+  max_shard_lines: 3000000
+  # 下一片若仅有 ≤N 行则视为占位（touch/空壳），在「前一片未满」时删除该文件并回退继续写前一片；0 关闭
+  placeholder_max_lines: 50
+  state_file: "output/metadata/extract_metadata_shard_state.json"
+
+# 每 uid 成功路径使用 ``commit_flush_and_finalize_profile``（持锁刷盘）；run 结束仍会 ``flush()`` 一次
+metadata_flush_every_n_lines: 2000
+metadata_flush_interval_sec: 12.0
+
+# extract 阶段专用（勿与 download 的 profiles_seen_db 混用）
+extract_profiles_seen_db: "output/state/extract_500px_user_profiles_seen.db"
+seen_db_synchronous: NORMAL
+
+extract_failed_profiles_log: "output/state/extract_500px_user_profiles_failed.jsonl"
+
+profile_urls_file: "output/500px_photographers_all_usernames.txt"
+profile_urls: []
+
+skip_completed_profiles: true
+retry_failed_only: false
+
+extract_stats_interval_sec: 600
+
+# true：除当次 extract_500px_{时间}_{pid}.log 外，还向 output/logs/extract_500px_appended.log 追加（跨 run 累计）
+extract_append_master_log: true
+# 每跑一次追加一行 JSON 摘要（总耗时、并发、成功/失败数等）；设为空字符串 "" 则关闭
+extract_run_summary_jsonl: "output/logs/extract_run_summary.jsonl"

@@ -1,4 +1,4 @@
-# 500px photographers 页 userSearch 分桶抓取（复制为 500px_usersearch_filter_batches.yaml 后编辑）
+# 500px photographers 页 userSearch 分桶抓取（在此文件编辑 runs）
 #
 # 说明：
 # - 网页上「Specialty」「Membership」等文案对应 GraphQL 的 key：SPECIALTIES、MEMBER_TYPE 等。

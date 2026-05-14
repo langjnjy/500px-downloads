@@ -62,7 +62,7 @@ type SeenDBConfig struct {
 	Path   string `yaml:"path"`
 }
 
-// SourceS3Config 与 config/download.yaml 的 source_s3 一致
+// SourceS3Config 与 go-downloader 各 download-*.yaml 中的 source_s3 一致
 type SourceS3Config struct {
 	Enabled                  bool   `yaml:"enabled"`
 	Profile                  string `yaml:"profile"`
@@ -86,7 +86,7 @@ type MetadataSyncConfig struct {
 	ExtractConfigPath string `yaml:"extract_config_path"`
 }
 
-// pipelineRootYAML 与仓库根 config/download.yaml 结构一致
+// pipelineRootYAML 与 go-downloader 各 download-*.yaml 顶层结构一致
 type pipelineRootYAML struct {
 	ProjectRoot                string             `yaml:"project_root"`
 	IncludeCategories          []string           `yaml:"include_categories"`
@@ -135,7 +135,7 @@ type s3YAML struct {
 	KeyPrefix string `yaml:"key_prefix"`
 }
 
-// LoadConfig 加载配置文件：支持仓库根 config/download.yaml 结构，以及旧版扁平 legacy
+// LoadConfig 加载配置文件：支持 go-downloader 的 pipelineRootYAML 结构，以及旧版扁平 legacy
 func LoadConfig(configPath string) (*Config, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -268,7 +268,7 @@ func mergePipelineYAML(root *pipelineRootYAML, projectRoot string) (*Config, err
 		cfg.MetadataBloomPathTemplate = root.MetadataBloomPathTemplate
 	}
 
-	// 模板默认值（与 download.yaml 一致）
+	// 模板默认值（与 download-http.yaml 一致）
 	if strings.TrimSpace(cfg.URLsDeltaDirTemplate) == "" {
 		cfg.URLsDeltaDirTemplate = "output/pipeline/{category}/download/urls"
 	}
