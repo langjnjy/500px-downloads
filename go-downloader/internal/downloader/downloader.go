@@ -8,15 +8,20 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/unsplash_downloads/go-downloader/internal/config"
+	"github.com/unsplash_downloads/go-downloader/internal/proxy"
 )
+
+var photoID500px = regexp.MustCompile(`500px\.org/photo/(\d+)`)
 
 // Downloader 下载器
 type Downloader struct {
@@ -36,30 +41,57 @@ type Stats struct {
 
 // DownloadResult 下载结果
 type DownloadResult struct {
-	Success       bool
-	FileName      string
-	Timestamp     string
-	Resolution    string
-	Error         error
-	ObjectID      string
-	SkippedLowRes bool // 因最短边 < MinSidePixels 跳过，不落盘不写 metadata，计入 Skipped
+	Success        bool
+	FileName       string
+	Timestamp      string
+	Resolution     string
+	Error          error
+	ObjectID       string
+	SkippedLowRes  bool // 因最短边 < MinSidePixels 跳过，不落盘不写 metadata，计入 Skipped
+	SkipFailedList bool // 不计入 failed_urls（已有文件、URL 过滤等，非 HTTP 失败）
 }
 
-// NewDownloader 创建新的下载器
+// NewDownloader 创建新的下载器（可选按 config 从 YAML 加载 HTTP 代理，轮询使用）。
 func NewDownloader(cfg *config.Config) *Downloader {
 	poolPerHost := cfg.HTTPPoolMaxsize
 	if poolPerHost <= 0 {
-		poolPerHost = cfg.Workers * 2
+		poolPerHost = maxInt(cfg.Workers*2, 64)
 	}
+	if poolPerHost < cfg.Workers {
+		poolPerHost = cfg.Workers
+	}
+
+	tr := &http.Transport{
+		MaxIdleConns:        maxInt(cfg.Workers*4, poolPerHost*2),
+		MaxIdleConnsPerHost: poolPerHost,
+		MaxConnsPerHost:     poolPerHost,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+	}
+
+	var proxyURLs []*url.URL
+	if cfg.UseProxy && strings.TrimSpace(cfg.ProxiesYAML) != "" {
+		p := strings.TrimSpace(cfg.ProxiesYAML)
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(cfg.ProjectRoot, p)
+		}
+		loaded, err := proxy.LoadFromYAML(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: 加载代理 YAML 失败，将直连: %v\n", err)
+		} else {
+			proxyURLs = loaded
+			var idx uint64
+			tr.Proxy = func(*http.Request) (*url.URL, error) {
+				i := atomic.AddUint64(&idx, 1)
+				return proxyURLs[int(i-1)%len(proxyURLs)], nil
+			}
+			fmt.Fprintf(os.Stderr, "已加载 %d 个 HTTP 代理（轮询）\n", len(proxyURLs))
+		}
+	}
+
 	httpClient := &http.Client{
-		Timeout: time.Duration(cfg.Timeout) * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        maxInt(cfg.Workers*4, poolPerHost*2),
-			MaxIdleConnsPerHost: poolPerHost,
-			MaxConnsPerHost:     poolPerHost,
-			IdleConnTimeout:     90 * time.Second,
-			DisableKeepAlives:   false,
-		},
+		Timeout:   time.Duration(cfg.Timeout) * time.Second,
+		Transport: tr,
 	}
 
 	return &Downloader{
@@ -74,27 +106,27 @@ func NewDownloader(cfg *config.Config) *Downloader {
 func (d *Downloader) Download(url string, downloadDir string) *DownloadResult {
 	if IsSkipURL(url) {
 		atomic.AddInt64(&d.stats.Skipped, 1)
-		return &DownloadResult{Success: false}
+		return &DownloadResult{Success: false, SkipFailedList: true}
 	}
-	objectID := sha1Hex(url)
-
-	ext := extFromURL(url)
-	fileName := fmt.Sprintf("%s.%s", objectID, ext)
-	if ext == "" {
-		fileName = fmt.Sprintf("%s.jpg", objectID)
-	}
+	objectID := ObjectIDForURL(d.cfg, url)
+	fileName := BaseNameForURL(d.cfg, url)
 	finalPath := filepath.Join(downloadDir, fileName)
+
+	preferExt := ""
+	if IsCrawlHashStyle(d.cfg) {
+		preferExt = GuessExtFromURL500px(url)
+	}
 
 	// 先检查文件是否已存在（与 Python 逻辑一致，先文件后 DB）
 	if d.cfg.DiskGlobFallback {
 		matches, _ := filepath.Glob(filepath.Join(downloadDir, fmt.Sprintf("%s.*", objectID)))
 		if len(matches) > 0 {
 			atomic.AddInt64(&d.stats.Skipped, 1)
-			return &DownloadResult{Success: false, FileName: fileName, ObjectID: objectID}
+			return &DownloadResult{Success: false, FileName: fileName, ObjectID: objectID, SkipFailedList: true}
 		}
 	} else if _, err := os.Stat(finalPath); err == nil {
 		atomic.AddInt64(&d.stats.Skipped, 1)
-		return &DownloadResult{Success: false, FileName: fileName, ObjectID: objectID}
+		return &DownloadResult{Success: false, FileName: fileName, ObjectID: objectID, SkipFailedList: true}
 	}
 
 	tmpPath := filepath.Join(downloadDir, fmt.Sprintf("%s.part", objectID))
@@ -103,7 +135,7 @@ func (d *Downloader) Download(url string, downloadDir string) *DownloadResult {
 	var result *DownloadResult
 	attempts := d.cfg.Retries + 1
 	for i := 0; i < attempts; i++ {
-		result = d.downloadHTTP(url, tmpPath, objectID)
+		result = d.downloadHTTP(url, tmpPath, objectID, preferExt)
 		if result.Success {
 			break
 		}
@@ -125,7 +157,8 @@ func (d *Downloader) Download(url string, downloadDir string) *DownloadResult {
 }
 
 // downloadHTTP 执行 HTTP 下载。当 MinSidePixels > 0 时先缓冲前 512KB 解析分辨率，最短边 < MinSidePixels 则不落盘、直接丢弃。
-func (d *Downloader) downloadHTTP(url, tmpPath string, objectID string) *DownloadResult {
+// preferExt 非空时强制用该扩展名落盘（crawl_hash 与 Python guess_ext_from_url 一致）；空则沿用 extFromURL / Content-Type。
+func (d *Downloader) downloadHTTP(url, tmpPath string, objectID string, preferExt string) *DownloadResult {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return &DownloadResult{Success: false, Error: err}
@@ -133,6 +166,13 @@ func (d *Downloader) downloadHTTP(url, tmpPath string, objectID string) *Downloa
 	if ua := d.pickUserAgent(); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
+	if m := photoID500px.FindStringSubmatch(url); len(m) >= 2 {
+		req.Header.Set("Referer", "https://500px.com/photo/"+m[1])
+	} else {
+		req.Header.Set("Referer", "https://500px.com/")
+	}
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
@@ -144,12 +184,17 @@ func (d *Downloader) downloadHTTP(url, tmpPath string, objectID string) *Downloa
 		return &DownloadResult{Success: false, Error: fmt.Errorf("HTTP %d", resp.StatusCode)}
 	}
 
-	ext := extFromURL(url)
-	if ext == "" {
-		contentType := resp.Header.Get("Content-Type")
-		ext = extFromContentType(contentType)
+	var ext string
+	if strings.TrimSpace(preferExt) != "" {
+		ext = strings.TrimSpace(preferExt)
+	} else {
+		ext = extFromURL(url)
 		if ext == "" {
-			ext = "jpg"
+			contentType := resp.Header.Get("Content-Type")
+			ext = extFromContentType(contentType)
+			if ext == "" {
+				ext = "jpg"
+			}
 		}
 	}
 	fileName := fmt.Sprintf("%s.%s", objectID, ext)

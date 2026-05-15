@@ -2,15 +2,11 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/sha1"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,12 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/unsplash_downloads/go-downloader/internal/config"
 	"github.com/unsplash_downloads/go-downloader/internal/db"
 	"github.com/unsplash_downloads/go-downloader/internal/downloader"
@@ -34,10 +24,20 @@ import (
 
 var deltaDateRe = regexp.MustCompile(`_urls_delta_(\d{2}|\d{4})-(\d{2})-(\d{2})(?:_shard)?$`)
 
-var (
-	s3ClientMu    sync.Mutex
-	s3ClientCache = map[string]*s3.S3{}
-)
+// recordImageKey 与 metadata writer / extract 的 image_key 规则一致。
+func recordImageKey(cfg *config.Config, categoryPlural, fileName string) string {
+	pfx := strings.Trim(strings.TrimSpace(cfg.ImageKeyPrefix), "/")
+	if downloader.IsCrawlHashStyle(cfg) {
+		if pfx != "" {
+			return pfx + "/" + fileName
+		}
+		return fileName
+	}
+	if pfx != "" {
+		return fmt.Sprintf("%s/%s/%s", pfx, categoryPlural, fileName)
+	}
+	return fmt.Sprintf("%s/%s", categoryPlural, fileName)
+}
 
 // sessionLog 写入 output/logs/download/ 下的带时间戳日志
 type sessionLog struct {
@@ -162,6 +162,20 @@ func main() {
 	// 清理孤儿 .part 文件
 	cleanupOrphanPartFiles(outputDir, 3600, slog)
 
+	useExtractMeta := cfg.IsExtractMetadataInput()
+	var upscaleDir string
+	if useExtractMeta {
+		upscaleDir = cfg.MediaUpscaleDir
+		if strings.TrimSpace(upscaleDir) == "" {
+			upscaleDir = filepath.Join(cfg.ProjectRoot, "output", "media_upscale")
+		}
+		if err := os.MkdirAll(upscaleDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "创建 media_upscale 目录失败: %v\n", err)
+			os.Exit(2)
+		}
+		cleanupOrphanPartFiles(upscaleDir, 3600, slog)
+	}
+
 	// 初始化 seen DB
 	var seenDB *db.SeenDB
 	if cfg.SeenDB.Enable {
@@ -183,33 +197,19 @@ func main() {
 	}
 
 	var metaSeen *db.SeenDB
-	if cfg.SeenDB.Enable {
+	if cfg.SeenDB.Enable && !useExtractMeta {
 		metaSeen = seenDB
 	}
 
 	// 创建下载器（seen 去重在 metadata writer，与 Python 一致）
 	dl := downloader.NewDownloader(cfg)
 
-	if err := maybePullDeltasFromS3(cfg, category, slog); err != nil {
-		slog.log(fmt.Sprintf("source_s3 pull failed category=%s err=%v", category, err))
-	}
-	stopPullScheduler := startSourceS3PullScheduler(cfg, []string{category}, slog)
-	defer stopPullScheduler()
-
-	// 创建元数据写入器（按 UTC 日单文件 metadata.jsonl；跨日轮换；seen 全局）
-	onDayClosed := func(dateUTC, dailyPath string) {
-		if err := syncMetadataForCategory(cfg, category, dateUTC, dailyPath, slog); err != nil && slog != nil {
-			slog.log(fmt.Sprintf("metadata sync failed category=%s err=%v", category, err))
-		}
-	}
-	metaWriter, err := metadata.NewWriterForFile(cfg, category, metaSeen, onDayClosed)
+	// 创建元数据写入器（按 UTC 日单文件 metadata.jsonl；跨日轮换；seen 全局；无 S3 回调）
+	metaWriter, err := metadata.NewWriterForFile(cfg, category, metaSeen, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "创建元数据写入器失败: %v\n", err)
 		os.Exit(2)
 	}
-	stopMetaSync := startMetadataSyncLoop(cfg, []string{category}, slog)
-	defer stopMetaSync()
-	// 退出时由 metaWriter.Close() 内对当前 UTC 日文件触发 onDayClosed 上传，避免仅用 time.Now() 与打开文件日不一致
 	defer metaWriter.Close()
 
 	// 创建失败 URL 写入器
@@ -244,89 +244,125 @@ func main() {
 	}()
 
 	// 工作队列
-	urlChan := make(chan string, 2000)
 	var wg sync.WaitGroup
 
-	// 启动 URL 生产者：优先消费 delta shards（含多轮 idle 重扫）
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(urlChan)
-		checkpointPath := cfg.ExpandPath(cfg.CheckpointPathTemplate, category)
-		if !cfg.RetryFailed {
-			if ok := consumeShardsWithRescan(cfg, category, checkpointPath, urlChan, slog); ok {
-				return
-			}
-			slog.log(fmt.Sprintf("no local shards found category=%s dir=%s", category, cfg.ExpandPath(cfg.URLsDeltaDirTemplate, category)))
-			return
+	if useExtractMeta {
+		jobChan := make(chan downloadJob, 2000)
+		sess := &downloadSession{
+			cfg:          cfg,
+			category:     category,
+			outputDir:    outputDir,
+			upscaleDir:   upscaleDir,
+			dl:           dl,
+			seenDB:       seenDB,
+			metaWriter:   metaWriter,
+			upscaleSem:   make(chan struct{}, maxInt(1, cfg.UpscaleWorkers)),
+			python:       cfg.UpscalePython,
+			script:       cfg.UpscaleScript,
+			appendFailed: appendFailed,
+			failedChan:   failedChan,
 		}
-		if !inputExists {
-			fmt.Fprintf(os.Stderr, "输入文件不存在且未发现可消费的 delta shard: %s\n", inputFile)
-			return
-		}
-		// retry_failed 模式：消费 failed_urls.txt
-		readFile := inputFile
-		var startOffset int64
-		if cfg.CheckpointInterval > 0 {
-			if path, off, ok := loadCheckpoint(checkpointPath); ok {
-				readFile = path
-				startOffset = off
-			}
-		}
-		file, err := os.Open(readFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "打开 URL 文件失败: %v\n", err)
-			return
-		}
-		defer file.Close()
-		if startOffset > 0 {
-			_, _ = file.Seek(startOffset, io.SeekStart)
-		}
-		reader := bufio.NewReaderSize(file, 512*1024)
-		offset := startOffset
-		linesSinceCheckpoint := 0
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil && err != io.EOF {
-				break
-			}
-			offset += int64(len(line))
-			url := parseURLLine(line)
-			if url != "" {
-				urlChan <- url
-				linesSinceCheckpoint++
-				if cfg.CheckpointInterval > 0 && linesSinceCheckpoint >= cfg.CheckpointInterval {
-					_ = saveCheckpoint(checkpointPath, readFile, offset)
-					linesSinceCheckpoint = 0
-				}
-			}
-			if err == io.EOF {
-				break
-			}
-		}
-	}()
 
-	// 启动下载 workers
-	for i := 0; i < cfg.Workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for url := range urlChan {
-				result := dl.Download(url, outputDir)
-				if result.Success {
-					imageKey := fmt.Sprintf("%s/%s/%s", cfg.ImageKeyPrefix, category, result.FileName)
-					metaWriter.WriteRecord(metadata.Record{
-						ImageURL:   url,
-						Resolution: result.Resolution,
-						Timestamp:  result.Timestamp,
-						ImageKey:   imageKey,
-						LocalPath:  filepath.Join(outputDir, result.FileName),
-					})
-				} else if !result.SkippedLowRes && appendFailed {
-					failedChan <- url
+			defer close(jobChan)
+			checkpointPath := cfg.ExpandPath(cfg.CheckpointPathTemplate, category)
+			if cfg.RetryFailed {
+				if !inputExists {
+					fmt.Fprintf(os.Stderr, "输入文件不存在: %s\n", inputFile)
+					return
 				}
+				consumeFailedURLsAsJobs(inputFile, checkpointPath, cfg.CheckpointInterval, jobChan)
+				return
+			}
+			if st, err := os.Stat(cfg.Input); err != nil || st.IsDir() {
+				slog.log(fmt.Sprintf("extract metadata not found path=%s err=%v", cfg.Input, err))
+				return
+			}
+			n, err := consumeExtractMetadataFile(cfg.Input, checkpointPath, cfg.CheckpointInterval, func(j downloadJob) {
+				jobChan <- j
+			})
+			if err != nil {
+				slog.log(fmt.Sprintf("extract metadata error path=%s err=%v", cfg.Input, err))
+			} else {
+				slog.log(fmt.Sprintf("extract metadata done path=%s emitted=%d", cfg.Input, n))
 			}
 		}()
+
+		for i := 0; i < cfg.Workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range jobChan {
+					sess.ProcessJob(job)
+				}
+			}()
+		}
+	} else {
+		urlChan := make(chan string, 2000)
+
+		// 启动 URL 生产者：优先消费 delta shards（含多轮 idle 重扫）
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(urlChan)
+			checkpointPath := cfg.ExpandPath(cfg.CheckpointPathTemplate, category)
+			if !cfg.RetryFailed {
+				if ok := consumeShardsWithRescan(cfg, category, checkpointPath, urlChan, slog); ok {
+					return
+				}
+				if st, err := os.Stat(cfg.Input); err == nil && !st.IsDir() {
+					n, err := consumeOneFile(cfg.Input, checkpointPath, cfg.CheckpointInterval, urlChan)
+					if err != nil {
+						slog.log(fmt.Sprintf("flat urls file error path=%s err=%v", cfg.Input, err))
+					} else {
+						slog.log(fmt.Sprintf("flat urls file done path=%s emitted=%d", cfg.Input, n))
+					}
+					return
+				}
+				slog.log(fmt.Sprintf("no local shards and no urls file category=%s dir=%s input=%s", category, cfg.ExpandPath(cfg.URLsDeltaDirTemplate, category), cfg.Input))
+				return
+			}
+			if !inputExists {
+				fmt.Fprintf(os.Stderr, "输入文件不存在且未发现可消费的 delta shard: %s\n", inputFile)
+				return
+			}
+			consumeFailedURLsAsStrings(inputFile, checkpointPath, cfg.CheckpointInterval, urlChan)
+		}()
+
+		for i := 0; i < cfg.Workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for url := range urlChan {
+					if cfg.SeenDB.Enable && seenDB != nil && downloader.IsCrawlHashStyle(cfg) {
+						k := metadata.SeenDedupeKey(cfg, url)
+						if k != "" {
+							if ok, err := seenDB.IsOK(k); err == nil && ok {
+								bn := downloader.BaseNameForURL(cfg, url)
+								if _, err := os.Stat(filepath.Join(outputDir, bn)); err == nil {
+									continue
+								}
+							}
+						}
+					}
+					result := dl.Download(url, outputDir)
+					if result.Success {
+						imageKey := recordImageKey(cfg, category, result.FileName)
+						metaWriter.WriteRecord(metadata.Record{
+							ImageURL:   url,
+							Resolution: result.Resolution,
+							Timestamp:  result.Timestamp,
+							ImageKey:   imageKey,
+							LocalPath:  filepath.Join(outputDir, result.FileName),
+						})
+					} else if appendFailed && !result.Success && !result.SkippedLowRes && !result.SkipFailedList {
+						failedChan <- url
+					}
+				}
+			}()
+		}
 	}
 
 	// 启动进度报告
@@ -371,7 +407,7 @@ func main() {
 	fmt.Printf("  本轮结束  elapsed=%s  downloaded=%d  failed=%d  skipped=%d\n", totalElapsed, success, failed, skipped)
 	fmt.Println("  " + strings.Repeat("─", 52))
 	if cfg.RetryFailed && seenDB != nil {
-		if err := pruneFailedBySeenDB(failedFile, seenDB); err != nil {
+		if err := pruneFailedBySeenDB(cfg, failedFile, seenDB); err != nil {
 			slog.log(fmt.Sprintf("prune failed_urls by seen_db error: %v", err))
 		}
 	}
@@ -567,10 +603,6 @@ func runMultiCategory(cfg *config.Config, slog *sessionLog) {
 		fmt.Fprintf(os.Stderr, "include_categories/exclude_categories 过滤后没有可处理的分类（请检查配置）\n")
 		os.Exit(2)
 	}
-	if err := initialPullAllCategories(cfg, categories, slog); err != nil {
-		fmt.Fprintf(os.Stderr, "启动阶段 source_s3 拉取失败: %v\n", err)
-		os.Exit(2)
-	}
 
 	metadataDir := filepath.Join(cfg.ProjectRoot, "output", "metadata")
 	linesPerFile := cfg.MetadataLinesPerFile
@@ -619,12 +651,7 @@ func runMultiCategory(cfg *config.Config, slog *sessionLog) {
 		if cfg.SeenDB.Enable {
 			wseen = seenDB
 		}
-		onDayClosed := func(dateUTC, dailyPath string) {
-			if err := syncMetadataForCategory(cfg, cat, dateUTC, dailyPath, slog); err != nil && slog != nil {
-				slog.log(fmt.Sprintf("metadata sync failed category=%s err=%v", cat, err))
-			}
-		}
-		metaWriter, err := metadata.NewWriterForFile(cfg, cat, wseen, onDayClosed)
+		metaWriter, err := metadata.NewWriterForFile(cfg, cat, wseen, nil)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "创建元数据写入器失败 %s: %v\n", category, err)
 			os.Exit(2)
@@ -654,11 +681,6 @@ func runMultiCategory(cfg *config.Config, slog *sessionLog) {
 			failedBuf:  bufio.NewWriter(failedFile),
 		}
 	}
-	stopMetaSync := startMetadataSyncLoop(cfg, categories, slog)
-	defer stopMetaSync()
-	stopPullScheduler := startSourceS3PullScheduler(cfg, categories, slog)
-	defer stopPullScheduler()
-
 	jobChan := make(chan multiCategoryJob, cfg.Workers*4)
 	var producerWg sync.WaitGroup
 	for _, category := range categories {
@@ -670,7 +692,17 @@ func runMultiCategory(cfg *config.Config, slog *sessionLog) {
 				if consumeShardsWithRescan(cfg, cat, ckPath, wrapCategoryJobChan(jobChan, cat), slog) {
 					return
 				}
-				slog.log(fmt.Sprintf("no local shards found category=%s dir=%s", cat, cfg.ExpandPath(cfg.URLsDeltaDirTemplate, cat)))
+				flatPath := cfg.ExpandPath(cfg.URLsPathTemplate, cat)
+				if st, err := os.Stat(flatPath); err == nil && !st.IsDir() {
+					n, err := consumeOneFile(flatPath, ckPath, cfg.CheckpointInterval, wrapCategoryJobChan(jobChan, cat))
+					if err != nil {
+						slog.log(fmt.Sprintf("flat urls file error category=%s path=%s err=%v", cat, flatPath, err))
+					} else {
+						slog.log(fmt.Sprintf("flat urls file done category=%s path=%s emitted=%d", cat, flatPath, n))
+					}
+					return
+				}
+				slog.log(fmt.Sprintf("no local shards and no urls file category=%s dir=%s flat=%s", cat, cfg.ExpandPath(cfg.URLsDeltaDirTemplate, cat), flatPath))
 				return
 			}
 			useFile := cfg.ExpandPath(cfg.FailedURLsPathTemplate, cat)
@@ -766,9 +798,20 @@ func runMultiCategory(cfg *config.Config, slog *sessionLog) {
 				if st == nil {
 					continue
 				}
+				if cfg.SeenDB.Enable && st.seenDB != nil && downloader.IsCrawlHashStyle(cfg) {
+					k := metadata.SeenDedupeKey(cfg, j.URL)
+					if k != "" {
+						if ok, err := st.seenDB.IsOK(k); err == nil && ok {
+							bn := downloader.BaseNameForURL(cfg, j.URL)
+							if _, err := os.Stat(filepath.Join(st.outputDir, bn)); err == nil {
+								continue
+							}
+						}
+					}
+				}
 				result := dl.Download(j.URL, st.outputDir)
 				if result.Success {
-					imageKey := fmt.Sprintf("%s/%s/%s", cfg.ImageKeyPrefix, j.Category, result.FileName)
+					imageKey := recordImageKey(cfg, j.Category, result.FileName)
 					st.metaWriter.WriteRecord(metadata.Record{
 						ImageURL:   j.URL,
 						Resolution: result.Resolution,
@@ -776,7 +819,7 @@ func runMultiCategory(cfg *config.Config, slog *sessionLog) {
 						ImageKey:   imageKey,
 						LocalPath:  filepath.Join(st.outputDir, result.FileName),
 					})
-				} else if !result.SkippedLowRes && !cfg.RetryFailed {
+				} else if !result.SkippedLowRes && !result.SkipFailedList && !cfg.RetryFailed {
 					failedChan <- multiCategoryFailed{URL: j.URL, Category: j.Category}
 				}
 			}
@@ -826,7 +869,7 @@ func runMultiCategory(cfg *config.Config, slog *sessionLog) {
 				continue
 			}
 			f := cfg.ExpandPath(cfg.FailedURLsPathTemplate, cat)
-			if err := pruneFailedBySeenDB(f, st.seenDB); err != nil {
+			if err := pruneFailedBySeenDB(cfg, f, st.seenDB); err != nil {
 				slog.log(fmt.Sprintf("prune retry failed_urls category=%s err=%v", cat, err))
 			}
 		}
@@ -981,534 +1024,7 @@ func wrapCategoryJobChan(jobChan chan<- multiCategoryJob, category string) chan<
 	return ch
 }
 
-func maybePullDeltasFromS3(cfg *config.Config, category string, slog *sessionLog) error {
-	s3 := cfg.SourceS3
-	if !s3.Enabled || strings.TrimSpace(s3.Bucket) == "" {
-		return nil
-	}
-	deltaDir := cfg.ExpandPath(cfg.URLsDeltaDirTemplate, category)
-	if err := os.MkdirAll(deltaDir, 0755); err != nil {
-		return err
-	}
-	prefix := strings.Trim(strings.TrimSpace(s3.KeyPrefix), "/")
-	if prefix == "" {
-		prefix = "pipeline-queue/pinterest"
-	}
-	remotePrefix := fmt.Sprintf("%s/%s/extract/urls/delta/", prefix, category)
-	client, err := getSourceS3Client(s3)
-	if err != nil {
-		return fmt.Errorf("初始化 source_s3 SDK 失败: %w", err)
-	}
-	keys, err := listDeltaKeysFromS3(client, s3, remotePrefix)
-	if err != nil {
-		return err
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		ai, ad, ab := deltaSortKey(filepath.Base(keys[i]))
-		aj, jd, jb := deltaSortKey(filepath.Base(keys[j]))
-		if ai != aj {
-			return ai
-		}
-		if ad != jd {
-			return ad < jd
-		}
-		return ab < jb
-	})
-	attempts := s3.PullRetry
-	if attempts <= 0 {
-		attempts = 1
-	}
-	for _, key := range keys {
-		base := filepath.Base(key)
-		localPath := filepath.Join(deltaDir, base)
-		if _, err := os.Stat(localPath); err == nil {
-			continue
-		}
-		uri := fmt.Sprintf("s3://%s/%s", s3.Bucket, key)
-		ok := false
-		lastErr := ""
-		for i := 0; i < attempts; i++ {
-			tmpPath := localPath + ".tmp"
-			_ = os.Remove(tmpPath)
-			if err := downloadObjectToFile(client, s3.Bucket, key, tmpPath); err == nil {
-				if s3.VerifyHead {
-					remoteLen, err := headObjectContentLength(client, s3.Bucket, key)
-					if err != nil {
-						lastErr = err.Error()
-						_ = os.Remove(tmpPath)
-					} else if fi, err := os.Stat(tmpPath); err != nil {
-						lastErr = err.Error()
-						_ = os.Remove(tmpPath)
-					} else if fi.Size() != remoteLen {
-						lastErr = fmt.Sprintf("size mismatch local=%d remote=%d", fi.Size(), remoteLen)
-						_ = os.Remove(tmpPath)
-					} else if err := os.Rename(tmpPath, localPath); err == nil {
-						ok = true
-						break
-					} else {
-						lastErr = err.Error()
-						_ = os.Remove(tmpPath)
-					}
-				} else if err := os.Rename(tmpPath, localPath); err == nil {
-					ok = true
-					break
-				} else {
-					lastErr = err.Error()
-					_ = os.Remove(tmpPath)
-				}
-			} else {
-				lastErr = err.Error()
-				_ = os.Remove(tmpPath)
-			}
-			if i < attempts-1 {
-				sleep := time.Duration(1<<i) * time.Second
-				if sleep > 15*time.Second {
-					sleep = 15 * time.Second
-				}
-				time.Sleep(sleep)
-			}
-		}
-		if !ok && slog != nil {
-			slog.log(fmt.Sprintf("pull shard failed finally uri=%s err=%s", uri, lastErr))
-		}
-	}
-	return nil
-}
-
-func startSourceS3PullScheduler(cfg *config.Config, categories []string, slog *sessionLog) func() {
-	s3 := cfg.SourceS3
-	if !s3.Enabled || !s3.PullSchedulerEnable || strings.TrimSpace(s3.Bucket) == "" || len(categories) == 0 {
-		return func() {}
-	}
-	cats := make([]string, 0, len(categories))
-	for _, c := range categories {
-		c = strings.TrimSpace(c)
-		if c != "" {
-			cats = append(cats, c)
-		}
-	}
-	if len(cats) == 0 {
-		return func() {}
-	}
-	interval := s3.PullSchedulerIntervalSec
-	if interval <= 0 {
-		interval = 120
-	}
-	hh, mm := parseHHMMUTC(s3.PullTimeUTC)
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	lastDaily := ""
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(time.Duration(interval) * time.Second)
-		defer ticker.Stop()
-		runSweep := func(nowUTC time.Time, reason string, force bool) {
-			date := nowUTC.Format("2006-01-02")
-			if !force && (nowUTC.Hour() < hh || (nowUTC.Hour() == hh && nowUTC.Minute() < mm) || lastDaily == date) {
-				return
-			}
-			pulled := 0
-			withData := 0
-			for _, cat := range cats {
-				if err := maybePullDeltasFromS3(cfg, cat, slog); err != nil {
-					if slog != nil {
-						slog.log(fmt.Sprintf("source_s3 scheduler pull failed category=%s err=%v", cat, err))
-					}
-					continue
-				}
-				pulled++
-				deltaDir := cfg.ExpandPath(cfg.URLsDeltaDirTemplate, cat)
-				if len(deltaShardFiles(deltaDir)) > 0 {
-					withData++
-				}
-			}
-			lastDaily = date
-			if slog != nil {
-				slog.log(fmt.Sprintf("source_s3 scheduler sweep done reason=%s utc>=%02d:%02d categories_ok=%d categories_with_shards=%d", reason, hh, mm, pulled, withData))
-			}
-		}
-		// 启动即执行一次 sweep，避免首轮主流程先退出导致空跑。
-		runSweep(time.Now().UTC(), "startup", true)
-		for {
-			nowUTC := time.Now().UTC()
-			runSweep(nowUTC, "scheduled", false)
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
-	return func() {
-		close(stop)
-		<-done
-	}
-}
-
-func initialPullAllCategories(cfg *config.Config, categories []string, slog *sessionLog) error {
-	okCount := 0
-	withData := 0
-	var firstErr error
-	for _, cat := range categories {
-		if err := maybePullDeltasFromS3(cfg, cat, slog); err != nil {
-			if slog != nil {
-				slog.log(fmt.Sprintf("source_s3 startup pull failed category=%s err=%v", cat, err))
-			}
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		okCount++
-		deltaDir := cfg.ExpandPath(cfg.URLsDeltaDirTemplate, cat)
-		cnt := len(deltaShardFiles(deltaDir))
-		if cnt > 0 {
-			withData++
-		}
-		if slog != nil {
-			slog.log(fmt.Sprintf("source_s3 startup pull category=%s local_shards=%d", cat, cnt))
-		}
-	}
-	if slog != nil {
-		slog.log(fmt.Sprintf("source_s3 startup pull done categories_ok=%d total=%d categories_with_shards=%d", okCount, len(categories), withData))
-	}
-	if firstErr != nil {
-		return firstErr
-	}
-	return nil
-}
-
-// durationUntilNextMetadataSyncUTC 返回距离下一次「当天 UTC 的 hh:mm」的时长（若已过则指向次日）。
-func durationUntilNextMetadataSyncUTC(hh, mm int) time.Duration {
-	now := time.Now().UTC()
-	target := time.Date(now.Year(), now.Month(), now.Day(), hh, mm, 0, 0, time.UTC)
-	if !now.Before(target) {
-		target = target.Add(24 * time.Hour)
-	}
-	return target.Sub(now)
-}
-
-func startMetadataSyncLoop(cfg *config.Config, categories []string, slog *sessionLog) func() {
-	if !cfg.MetadataSync.Enabled || len(categories) == 0 {
-		return func() {}
-	}
-	ms := cfg.MetadataSync
-	hh, mm := parseHHMMUTC(ms.TimeUTC)
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		runAll := func(reason string) {
-			date := time.Now().UTC().Format("2006-01-02")
-			for _, cat := range categories {
-				cat = strings.TrimSpace(cat)
-				if cat == "" {
-					continue
-				}
-				daily := cfg.ExpandPathWithDate(cfg.MetadataDailyPathTemplate, cat, date)
-				if err := syncMetadataForCategory(cfg, cat, date, daily, slog); err != nil && slog != nil {
-					slog.log(fmt.Sprintf("metadata sync failed category=%s reason=%s err=%v", cat, reason, err))
-				}
-			}
-		}
-		// 进程启动（重启）后立即上传一次
-		runAll("startup")
-		var ticker *time.Ticker
-		var tickerCh <-chan time.Time
-		if ms.IntervalSec > 0 {
-			interval := time.Duration(maxInt(60, ms.IntervalSec)) * time.Second
-			ticker = time.NewTicker(interval)
-			defer ticker.Stop()
-			tickerCh = ticker.C
-		}
-		nextDaily := time.NewTimer(durationUntilNextMetadataSyncUTC(hh, mm))
-		defer nextDaily.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-nextDaily.C:
-				runAll("daily_utc")
-				nextDaily.Reset(durationUntilNextMetadataSyncUTC(hh, mm))
-			case <-tickerCh:
-				runAll("interval")
-			}
-		}
-	}()
-	return func() {
-		close(stop)
-		<-done
-	}
-}
-
-func syncMetadataForCategory(cfg *config.Config, category, dateUTC, dailyPath string, slog *sessionLog) error {
-	ms := cfg.MetadataSync
-	if !ms.Enabled {
-		return nil
-	}
-	if strings.TrimSpace(cfg.SourceS3.Bucket) == "" {
-		return fmt.Errorf("metadata_sync 启用但 source_s3.bucket 为空")
-	}
-	client, err := getSourceS3Client(cfg.SourceS3)
-	if err != nil {
-		return fmt.Errorf("创建 metadata sync SDK client 失败: %w", err)
-	}
-	keyPrefix := strings.Trim(strings.TrimSpace(ms.KeyPrefix), "/")
-	if keyPrefix == "" {
-		keyPrefix = "metadata/photo-download"
-	}
-	dailyKey := fmt.Sprintf("%s/%s/%s/metadata.jsonl", keyPrefix, dateUTC, category)
-	if err := putFileToS3WithRetry(client, cfg.SourceS3.Bucket, dailyKey, dailyPath, maxInt(1, ms.Retry)); err != nil {
-		return fmt.Errorf("上传 daily metadata 失败: %w", err)
-	}
-	if slog != nil {
-		slog.log(fmt.Sprintf("metadata sync uploaded daily category=%s key=%s", category, dailyKey))
-	}
-	return nil
-}
-
-func putFileToS3WithRetry(client *s3.S3, bucket, key, localPath string, attempts int) error {
-	if attempts <= 0 {
-		attempts = 1
-	}
-	var lastErr error
-	for i := 0; i < attempts; i++ {
-		err := putFileToS3(client, bucket, key, localPath)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if !isRetriableS3Err(err) || i == attempts-1 {
-			break
-		}
-		sleep := time.Duration(1<<i) * time.Second
-		if sleep > 20*time.Second {
-			sleep = 20 * time.Second
-		}
-		time.Sleep(sleep)
-	}
-	return lastErr
-}
-
-func putFileToS3(client *s3.S3, bucket, key, localPath string) error {
-	f, err := os.Open(localPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	_, err = client.PutObjectWithContext(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(bucket),
-		Key:         aws.String(key),
-		Body:        f,
-		ContentType: aws.String("application/x-ndjson"),
-	})
-	return err
-}
-
-func parseHHMMUTC(raw string) (int, int) {
-	s := strings.TrimSpace(strings.ToLower(raw))
-	if s == "" {
-		return 0, 1
-	}
-	parts := strings.SplitN(s, ":", 2)
-	if len(parts) != 2 {
-		return 0, 1
-	}
-	hh, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
-	mm, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err1 != nil || err2 != nil || hh < 0 || hh > 23 || mm < 0 || mm > 59 {
-		return 0, 1
-	}
-	return hh, mm
-}
-
-func listDeltaKeysFromS3(client *s3.S3, s3cfg config.SourceS3Config, remotePrefix string) ([]string, error) {
-	keys := make([]string, 0, 128)
-	attempts := maxInt(1, s3cfg.PullRetry)
-	for i := 0; i < attempts; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		err := client.ListObjectsV2PagesWithContext(ctx, &s3.ListObjectsV2Input{
-			Bucket:  aws.String(s3cfg.Bucket),
-			Prefix:  aws.String(remotePrefix),
-			MaxKeys: aws.Int64(1000),
-		}, func(page *s3.ListObjectsV2Output, _ bool) bool {
-			for _, item := range page.Contents {
-				if item == nil || item.Key == nil {
-					continue
-				}
-				key := strings.TrimSpace(aws.StringValue(item.Key))
-				base := filepath.Base(key)
-				if key == "" || !strings.Contains(base, "_urls_delta_") {
-					continue
-				}
-				keys = append(keys, key)
-			}
-			return true
-		})
-		cancel()
-		if err == nil {
-			return keys, nil
-		}
-		if !isRetriableS3Err(err) || i == attempts-1 {
-			return nil, fmt.Errorf("list-objects-v2 SDK 失败: %w", err)
-		}
-		sleep := time.Duration(1<<i) * time.Second
-		if sleep > 15*time.Second {
-			sleep = 15 * time.Second
-		}
-		time.Sleep(sleep)
-	}
-	return keys, nil
-}
-
-func downloadObjectToFile(client *s3.S3, bucket, key, dst string) error {
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	resp, err := client.GetObjectWithContext(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return err
-	}
-	if err := out.Sync(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func headObjectContentLength(client *s3.S3, bucket, key string) (int64, error) {
-	attempts := 2
-	var lastErr error
-	for i := 0; i < attempts; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		out, err := client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(key),
-		})
-		cancel()
-		if err == nil {
-			return aws.Int64Value(out.ContentLength), nil
-		}
-		lastErr = err
-		if !isRetriableS3Err(err) {
-			break
-		}
-		time.Sleep(time.Duration(1+i) * time.Second)
-	}
-	return 0, lastErr
-}
-
-func newSourceS3Client(s3cfg config.SourceS3Config) (*s3.S3, error) {
-	region := strings.TrimSpace(s3cfg.RegionName)
-	if region == "" {
-		region = "us-east-1"
-	}
-	httpClient := &http.Client{
-		Timeout: 120 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:          64,
-			MaxIdleConnsPerHost:   64,
-			ResponseHeaderTimeout: 45 * time.Second,
-			TLSHandshakeTimeout:   15 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-		},
-	}
-	awsCfg := aws.Config{
-		Region:      aws.String(region),
-		HTTPClient:  httpClient,
-		Credentials: credentials.NewSharedCredentials("", s3cfg.Profile),
-		MaxRetries:  aws.Int(maxInt(2, s3cfg.PullRetry)),
-	}
-	if ep := strings.TrimSpace(s3cfg.EndpointURL); ep != "" {
-		awsCfg.Endpoint = aws.String(ep)
-		awsCfg.S3ForcePathStyle = aws.Bool(true)
-	}
-	sess, err := session.NewSessionWithOptions(session.Options{
-		Profile: s3cfg.Profile,
-		Config:  awsCfg,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return s3.New(sess), nil
-}
-
-func getSourceS3Client(s3cfg config.SourceS3Config) (*s3.S3, error) {
-	key := strings.Join([]string{
-		strings.TrimSpace(s3cfg.Profile),
-		strings.TrimSpace(s3cfg.RegionName),
-		strings.TrimSpace(s3cfg.EndpointURL),
-	}, "|")
-	s3ClientMu.Lock()
-	if c, ok := s3ClientCache[key]; ok {
-		s3ClientMu.Unlock()
-		return c, nil
-	}
-	s3ClientMu.Unlock()
-	c, err := newSourceS3Client(s3cfg)
-	if err != nil {
-		return nil, err
-	}
-	s3ClientMu.Lock()
-	if existing, ok := s3ClientCache[key]; ok {
-		s3ClientMu.Unlock()
-		return existing, nil
-	}
-	s3ClientCache[key] = c
-	s3ClientMu.Unlock()
-	return c, nil
-}
-
-func isRetriableS3Err(err error) bool {
-	if err == nil {
-		return false
-	}
-	var nerr net.Error
-	if errors.As(err, &nerr) && (nerr.Timeout() || nerr.Temporary()) {
-		return true
-	}
-	var reqErr awserr.RequestFailure
-	if errors.As(err, &reqErr) {
-		code := reqErr.StatusCode()
-		return code == 429 || (code >= 500 && code <= 599)
-	}
-	var awsErr awserr.Error
-	if errors.As(err, &awsErr) {
-		switch awsErr.Code() {
-		case request.CanceledErrorCode, "RequestTimeout", "Throttling", "SlowDown":
-			return true
-		}
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "timeout") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "no such host")
-}
-
-func deltaSortKey(name string) (bool, string, string) {
-	base := strings.TrimSuffix(filepath.Base(name), filepath.Ext(name))
-	m := deltaDateRe.FindStringSubmatch(base)
-	if len(m) != 4 {
-		return true, "9999-99-99", base
-	}
-	year := m[1]
-	if len(year) == 2 {
-		year = "20" + year
-	}
-	return false, fmt.Sprintf("%s-%s-%s", year, m[2], m[3]), base
-}
-
-func pruneFailedBySeenDB(path string, seen *db.SeenDB) error {
+func pruneFailedBySeenDB(cfg *config.Config, path string, seen *db.SeenDB) error {
 	in, err := os.Open(path)
 	if err != nil {
 		return err
@@ -1527,14 +1043,14 @@ func pruneFailedBySeenDB(path string, seen *db.SeenDB) error {
 		if line == "" {
 			continue
 		}
-		key := metadata.NormalizeImageURLKey(line)
+		key := metadata.SeenDedupeKey(cfg, line)
 		if key == "" {
 			continue
 		}
 		if _, ok := kept[key]; ok {
 			continue
 		}
-		has, err := seen.Contains(key)
+		has, err := seen.IsOK(key)
 		if err != nil {
 			continue
 		}

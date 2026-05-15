@@ -282,7 +282,7 @@ func (w *Writer) run() {
 				w.currentCount = 0
 			}
 		}
-		key := NormalizeImageURLKey(record.ImageURL)
+		key := SeenDedupeKey(w.cfg, record.ImageURL)
 		if key == "" {
 			if record.LocalPath != "" {
 				_ = os.Remove(record.LocalPath)
@@ -329,11 +329,17 @@ func (w *Writer) run() {
 			}
 		}
 
-		// 与 scripts/crawl_unsplash.py 一致：image_key = <prefix>/<UTC日>/<文件名>，且与当前打开的 daily 元数据文件所用 UTC 日一致
+		// crawl_hash：image_key = <prefix>/<basename>（与 extract 一致）。其它 fixed daily：prefix/UTC 日/basename。
 		if w.fixedDailyFile && w.cfg != nil && strings.TrimSpace(record.LocalPath) != "" {
 			prefix := strings.Trim(strings.TrimSpace(w.cfg.ImageKeyPrefix), "/")
 			base := filepath.Base(record.LocalPath)
-			if prefix != "" && w.currentDateUTC != "" && base != "" && base != "." {
+			if base == "" || base == "." {
+				// 保持 WriteRecord 传入的 ImageKey
+			} else if strings.EqualFold(strings.TrimSpace(w.cfg.ImageKeyStyle), "crawl_hash") {
+				if prefix != "" {
+					record.ImageKey = prefix + "/" + base
+				}
+			} else if prefix != "" && w.currentDateUTC != "" {
 				record.ImageKey = fmt.Sprintf("%s/%s/%s", prefix, w.currentDateUTC, base)
 			}
 		}

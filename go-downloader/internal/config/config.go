@@ -28,6 +28,17 @@ type Config struct {
 	FailedFileName            string             `yaml:"failed_file_name"`
 	DiskGlobFallback          bool               `yaml:"disk_glob_fallback"`
 	ImageKeyPrefix            string             `yaml:"image_key_prefix"`
+	ImageKeyStyle             string             `yaml:"image_key_style"`
+	InputMode                 string             `yaml:"input_mode"`
+	ExtractMetadataPathTemplate string           `yaml:"extract_metadata_path_template"`
+	MediaUpscaleDirTemplate   string             `yaml:"media_upscale_dir_template"`
+	MediaUpscaleDir           string             `yaml:"-"`
+	ResolutionMinShort        int                `yaml:"resolution_min_short"`
+	ResolutionMinLong         int                `yaml:"resolution_min_long"`
+	UpscalePython             string             `yaml:"upscale_python"`
+	UpscaleScriptTemplate     string             `yaml:"upscale_script"`
+	UpscaleScript             string             `yaml:"-"`
+	UpscaleWorkers            int                `yaml:"upscale_workers"`
 	SeenDB                    SeenDBConfig       `yaml:"seen_db"`
 	CheckpointInterval        int                `yaml:"checkpoint_interval"`
 	MinSidePixels             int                `yaml:"min_side_pixels"`
@@ -43,6 +54,8 @@ type Config struct {
 	UseUserAgents             bool               `yaml:"use_user_agents"`
 	HTTPUserAgent             string             `yaml:"http_user_agent"`
 	HTTPPoolMaxsize           int                `yaml:"http_pool_maxsize"`
+	ProxiesYAML               string             `yaml:"proxies_yaml"`
+	UseProxy                  bool               `yaml:"use_proxy"`
 	MetadataFlushEvery        int                `yaml:"metadata_flush_every"`
 	MetadataFlushIntervalSec  int                `yaml:"metadata_flush_interval_sec"`
 	Loop                      bool               `yaml:"loop"`
@@ -89,6 +102,16 @@ type MetadataSyncConfig struct {
 // pipelineRootYAML 与 go-downloader 各 download-*.yaml 顶层结构一致
 type pipelineRootYAML struct {
 	ProjectRoot                string             `yaml:"project_root"`
+	ImageKeyPrefix             string             `yaml:"image_key_prefix"`
+	ImageKeyStyle              string             `yaml:"image_key_style"`
+	InputMode                  string             `yaml:"input_mode"`
+	ExtractMetadataPathTemplate string            `yaml:"extract_metadata_path_template"`
+	MediaUpscaleDirTemplate    string             `yaml:"media_upscale_dir_template"`
+	ResolutionMinShort         int                `yaml:"resolution_min_short"`
+	ResolutionMinLong          int                `yaml:"resolution_min_long"`
+	UpscalePython              string             `yaml:"upscale_python"`
+	UpscaleScript              string             `yaml:"upscale_script"`
+	UpscaleWorkers             int                `yaml:"upscale_workers"`
 	IncludeCategories          []string           `yaml:"include_categories"`
 	ExcludeCategories          []string           `yaml:"exclude_categories"`
 	URLsPathTemplate           string             `yaml:"urls_path_template"`
@@ -118,6 +141,8 @@ type downloadBlockYAML struct {
 	UseUserAgents            bool     `yaml:"use_user_agents"`
 	HTTPUserAgent            string   `yaml:"http_user_agent"`
 	HTTPPoolMaxsize          int      `yaml:"http_pool_maxsize"`
+	ProxiesYAML              string   `yaml:"proxies_yaml"`
+	UseProxy                 bool     `yaml:"use_proxy"`
 	ProgressIntervalSec      int      `yaml:"progress_interval_sec"`
 	DiskGlobFallback         bool     `yaml:"disk_glob_fallback"`
 	MetadataFlushEvery       int      `yaml:"metadata_flush_every"`
@@ -211,7 +236,32 @@ func mergePipelineYAML(root *pipelineRootYAML, projectRoot string) (*Config, err
 	cfg.ExtractDir = ""
 	cfg.FilteredOut = ""
 
-	cfg.Input = resolvePath(root.URLsPathTemplate, projectRoot, cat)
+	cfg.InputMode = strings.TrimSpace(root.InputMode)
+	cfg.ExtractMetadataPathTemplate = strings.TrimSpace(root.ExtractMetadataPathTemplate)
+	cfg.MediaUpscaleDirTemplate = strings.TrimSpace(root.MediaUpscaleDirTemplate)
+	cfg.ResolutionMinShort = root.ResolutionMinShort
+	cfg.ResolutionMinLong = root.ResolutionMinLong
+	cfg.UpscalePython = strings.TrimSpace(root.UpscalePython)
+	cfg.UpscaleWorkers = root.UpscaleWorkers
+	upsTpl := strings.TrimSpace(root.UpscaleScript)
+	if upsTpl == "" {
+		upsTpl = "scripts/upscale_cubic_2x.py"
+	}
+	cfg.UpscaleScriptTemplate = upsTpl
+	cfg.UpscaleScript = resolvePath(upsTpl, projectRoot, cat)
+	if strings.TrimSpace(cfg.MediaUpscaleDirTemplate) != "" {
+		cfg.MediaUpscaleDir = resolvePath(cfg.MediaUpscaleDirTemplate, projectRoot, cat)
+	}
+
+	if strings.EqualFold(cfg.InputMode, "extract_metadata") {
+		metaTpl := cfg.ExtractMetadataPathTemplate
+		if metaTpl == "" {
+			metaTpl = "output/metadata/extract_metadata_1.jsonl"
+		}
+		cfg.Input = resolvePath(metaTpl, projectRoot, cat)
+	} else {
+		cfg.Input = resolvePath(root.URLsPathTemplate, projectRoot, cat)
+	}
 	cfg.URLsPathTemplate = root.URLsPathTemplate
 	cfg.OutputDir = resolvePath(root.MediaDirTemplate, projectRoot, cat)
 	cfg.MediaDirTemplate = root.MediaDirTemplate
@@ -240,6 +290,8 @@ func mergePipelineYAML(root *pipelineRootYAML, projectRoot string) (*Config, err
 	cfg.UseUserAgents = d.UseUserAgents
 	cfg.HTTPUserAgent = d.HTTPUserAgent
 	cfg.HTTPPoolMaxsize = d.HTTPPoolMaxsize
+	cfg.ProxiesYAML = d.ProxiesYAML
+	cfg.UseProxy = d.UseProxy
 	cfg.MetadataFlushEvery = d.MetadataFlushEvery
 	cfg.MetadataFlushIntervalSec = d.MetadataFlushIntervalSec
 	cfg.Loop = d.Loop
@@ -254,7 +306,11 @@ func mergePipelineYAML(root *pipelineRootYAML, projectRoot string) (*Config, err
 		cfg.SeenDB.Path = resolvePath(root.MetadataSeenDBPathTemplate, projectRoot, cat)
 	}
 
-	cfg.ImageKeyPrefix = strings.TrimSpace(root.S3.KeyPrefix)
+	cfg.ImageKeyPrefix = strings.TrimSpace(root.ImageKeyPrefix)
+	if cfg.ImageKeyPrefix == "" {
+		cfg.ImageKeyPrefix = strings.TrimSpace(root.S3.KeyPrefix)
+	}
+	cfg.ImageKeyStyle = strings.TrimSpace(root.ImageKeyStyle)
 	cfg.SourceS3 = root.SourceS3
 	cfg.MetadataSync = root.MetadataSync
 
@@ -378,6 +434,32 @@ func applyDefaults(cfg *Config) {
 	if strings.TrimSpace(cfg.MetadataBloomPathTemplate) == "" {
 		cfg.MetadataBloomPathTemplate = "output/pipeline/{category}/download/metadata/seen/metadata.bloom"
 	}
+	if cfg.ResolutionMinShort <= 0 {
+		cfg.ResolutionMinShort = 1080
+	}
+	if cfg.ResolutionMinLong <= 0 {
+		cfg.ResolutionMinLong = 2000
+	}
+	if strings.TrimSpace(cfg.UpscalePython) == "" {
+		cfg.UpscalePython = "python3"
+	}
+	if cfg.UpscaleWorkers <= 0 {
+		cfg.UpscaleWorkers = 4
+	}
+	if strings.TrimSpace(cfg.UpscaleScript) == "" && strings.TrimSpace(cfg.UpscaleScriptTemplate) != "" {
+		cfg.UpscaleScript = resolvePath(cfg.UpscaleScriptTemplate, cfg.ProjectRoot, cfg.Category)
+	}
+	if strings.TrimSpace(cfg.UpscaleScript) == "" {
+		cfg.UpscaleScript = resolvePath("scripts/upscale_cubic_2x.py", cfg.ProjectRoot, cfg.Category)
+	}
+}
+
+// IsExtractMetadataInput 从 extract_metadata_*.jsonl 读入（含 image_url / resolution）。
+func (c *Config) IsExtractMetadataInput() bool {
+	if c == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(c.InputMode), "extract_metadata")
 }
 
 // resolvePath 解析路径，支持模板变量 {category}、{category_plural}（均替换为 category）

@@ -1,19 +1,33 @@
-# 500px-downloads：与 `download-unsplash.yaml` 同结构，路径与 checkpoint / 失败列表按 500px 命名。
-# 用于「URL 列表 → HTTP 下载 → output/media + 按日 metadata」管线（与 `scripts/download.py` 的 gallery-dl 流程独立，可并行准备 URL 列表）。
+# 500px：从 extract metadata JSONL 下载到 output/media（HTTP + 代理，无 S3）。
 #
-# 在仓库根目录运行：
+# 在仓库根执行：
+#   go build -o go-downloader/download ./go-downloader/cmd/download
 #   ./go-downloader/download -config go-downloader/config/download-500px.yaml
 #
-# ~/.aws/config 中 [profile aws-s3]；仅本地下载时保持 source_s3 / metadata_sync / s3 均为 enabled:false。
+# 输入：output/metadata/extract_metadata_1.jsonl（每行 JSON，含 image_url / resolution）。
+# 分辨率满足「最短边>=1080 且 长边>=2000」→ 直存 media；否则 media_upscale → OpenCV cubic 2x → media。
+# seen.db 记录 image_url、status（ok/failed）、resolution；失败 URL 另写 failed 文件供重试。
+#
+# download.retries：失败后的「额外重试」次数；retries: 3 表示最多共 4 次 HTTP 尝试。
 
 project_root: ".."
+image_key_prefix: "500px-downloads/media"
+image_key_style: "crawl_hash"
+
+input_mode: "extract_metadata"
+extract_metadata_path_template: "output/metadata/extract_metadata_1.jsonl"
+media_upscale_dir_template: "output/media_upscale"
+resolution_min_short: 1080
+resolution_min_long: 2000
+upscale_python: "python3"
+upscale_script: "scripts/upscale_cubic_2x.py"
+upscale_workers: 8
 
 include_categories:
   - 500px
 exclude_categories: []
 
-# 每行一个图片直链 URL（按需生成；默认路径占位）
-urls_path_template: "output/urls/500px_urls.txt"
+urls_path_template: "output/urls/extract_urls_1"
 urls_delta_dir_template: "output/urls/delta"
 pipeline_root: "output"
 
@@ -31,13 +45,15 @@ metadata_seen_db_enable: true
 metadata_seen_db_path_template: "output/metadata/seen/500px_seen.db"
 
 download:
-  workers: 48
+  workers: 160
   retries: 3
   timeout_sec: 120
   skip_suffixes: [".m3u8", ".mp4"]
   use_user_agents: true
   http_user_agent: ""
-  http_pool_maxsize: 64
+  http_pool_maxsize: 192
+  use_proxy: true
+  proxies_yaml: "config/proxies.yaml"
   progress_interval_sec: 600
   disk_glob_fallback: true
   metadata_flush_every: 5000
@@ -48,41 +64,3 @@ download:
   checkpoint_interval_lines: 50000
   checkpoint_path_template: "output/checkpoints/500px_download.ckpt"
   failed_urls_path_template: "output/failed/500px_failed_urls.txt"
-
-source_s3:
-  enabled: false
-  profile: "aws-s3"
-  region_name: "us-west-2"
-  bucket: "nobodies-ai-data"
-  key_prefix: ""
-  pull_retry: 3
-  verify_head: true
-  pull_scheduler_enable: false
-  pull_time_utc: "00:15"
-  pull_scheduler_interval_sec: 120
-
-metadata_sync:
-  enabled: false
-  time_utc: "00:05"
-  interval_sec: 0
-  retry: 3
-  key_prefix: "metadata/500px-photo-download"
-  extract_config_path: ""
-
-s3:
-  enabled: false
-  profile: "aws-s3"
-  region_name: "us-west-2"
-  bucket: "nobodies-ai-data"
-  key_prefix: "500px-photo-download"
-  delete_after_upload: true
-  delete_metadata_after_upload: false
-  upload_workers: 8
-  pending_max_files: 10000
-  pending_max_bytes_mb: 12000
-  upload_retries: 3
-  upload_retry_base_sec: 0.5
-  upload_retry_max_sec: 60
-  cli_connect_timeout_sec: 60
-  cli_read_timeout_sec: 300
-  dry_run: false
