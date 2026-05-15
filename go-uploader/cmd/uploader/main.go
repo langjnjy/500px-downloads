@@ -797,7 +797,21 @@ func mediaDir(cfg *config.Config, category string) string {
 	return filepath.Join(cfg.OutputDir, cfg.PipelineRootDir, category, "download", "media")
 }
 
-// shouldUploadLocalFile 跳过隐藏文件与未完成下载（如 .part）
+// 与 pexels-downloads/go-uploader eligibleForUpload 对齐，并覆盖 go-downloader 临时文件：
+// *.part（下载中）、*.tmp / *.temp（原子写、extract  upscale 的 .up.tmp）、常见浏览器未完成后缀。
+var uploadAllowedImageExts = map[string]struct{}{
+	".avif": {}, ".bmp": {}, ".gif": {}, ".jpeg": {}, ".jpg": {}, ".png": {}, ".tif": {}, ".tiff": {}, ".webp": {},
+}
+
+var uploadIncompleteSuffixes = []string{
+	".part",
+	".tmp",
+	".temp",
+	".crdownload",
+	".download",
+}
+
+// shouldUploadLocalFile 仅上传成品图片：跳过隐藏文件、临时/半成品扩展名、非图片扩展名。
 func shouldUploadLocalFile(path string, info os.FileInfo) bool {
 	if info == nil || info.IsDir() {
 		return false
@@ -807,10 +821,17 @@ func shouldUploadLocalFile(path string, info os.FileInfo) bool {
 		return false
 	}
 	lower := strings.ToLower(name)
-	if strings.HasSuffix(lower, ".part") {
+	for _, suf := range uploadIncompleteSuffixes {
+		if strings.HasSuffix(lower, suf) {
+			return false
+		}
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	if ext == "" {
 		return false
 	}
-	return true
+	_, ok := uploadAllowedImageExts[ext]
+	return ok
 }
 
 func makeUploadRecord(cfg *config.Config, category, localPath, uploadDateUTC string) uploader.Record {

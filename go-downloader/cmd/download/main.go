@@ -39,7 +39,8 @@ func recordImageKey(cfg *config.Config, categoryPlural, fileName string) string 
 	return fmt.Sprintf("%s/%s", categoryPlural, fileName)
 }
 
-// sessionLog 写入 output/logs/download/ 下的带时间戳日志
+// sessionLog 写入 output/logs/download/ 下的带时间戳日志。
+// 每条 log 不 fsync，减少高并发进度日志时的磁盘压力；进程正常退出时在 close 里统一 Sync。
 type sessionLog struct {
 	f *os.File
 }
@@ -52,22 +53,42 @@ func (s *sessionLog) log(msg string) {
 	if _, err := fmt.Fprintf(s.f, "[%s] %s\n", ts, msg); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: 写 session 日志失败: %v\n", err)
 	}
+}
+
+func (s *sessionLog) close() {
+	if s == nil || s.f == nil {
+		return
+	}
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	_, _ = fmt.Fprintf(s.f, "[%s] === download session end ===\n", ts)
 	if err := s.f.Sync(); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Sync session 日志失败: %v\n", err)
 	}
+	_ = s.f.Close()
+	s.f = nil
 }
 
-func openSessionLog(projectRoot string) (*sessionLog, error) {
+func openSessionLog(projectRoot, configPath string) (*sessionLog, error) {
 	logDir := filepath.Join(projectRoot, "output", "logs", "download")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, err
 	}
 	name := fmt.Sprintf("download_%s.log", time.Now().Format("2006-01-02_150405"))
-	f, err := os.Create(filepath.Join(logDir, name))
+	logPath := filepath.Join(logDir, name)
+	f, err := os.Create(logPath)
 	if err != nil {
 		return nil, err
 	}
-	return &sessionLog{f: f}, nil
+	absLog, _ := filepath.Abs(logPath)
+	fmt.Fprintf(os.Stderr, "下载会话日志: %s\n", absLog)
+	s := &sessionLog{f: f}
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	cfgLine := configPath
+	if cfgAbs, err := filepath.Abs(configPath); err == nil {
+		cfgLine = cfgAbs
+	}
+	_, _ = fmt.Fprintf(f, "[%s] === download session start config=%s ===\n", ts, cfgLine)
+	return s, nil
 }
 
 var (
@@ -109,18 +130,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
 		os.Exit(1)
 	}
+	configAbs := configFile
 	if abs, err := filepath.Abs(configFile); err == nil {
+		configAbs = abs
 		fmt.Fprintf(os.Stderr, "使用配置: %s\n", abs)
 	}
 	downloader.SetSkipSuffixes(cfg.SkipSuffixes)
-	slog, err := openSessionLog(cfg.ProjectRoot)
+	slog, err := openSessionLog(cfg.ProjectRoot, configAbs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "创建日志文件失败: %v\n", err)
 		os.Exit(1)
 	}
 	defer func() {
-		if slog != nil && slog.f != nil {
-			slog.f.Close()
+		if slog != nil {
+			slog.close()
 		}
 	}()
 
@@ -146,10 +169,6 @@ func main() {
 	}
 	inputStat, inputErr := os.Stat(inputFile)
 	inputExists := inputErr == nil && !inputStat.IsDir()
-	if cfg.RetryFailed && !inputExists {
-		fmt.Fprintf(os.Stderr, "输入文件不存在: %s\n", inputFile)
-		os.Exit(2)
-	}
 
 	// 创建输出目录
 	category := cfg.Category
@@ -159,8 +178,8 @@ func main() {
 		os.Exit(2)
 	}
 
-	// 清理孤儿 .part 文件
-	cleanupOrphanPartFiles(outputDir, 3600, slog)
+	// 清理上次中断遗留的 *.part / *.up.tmp（勿同目录并行跑两个 download）
+	cleanupStaleMediaTemps(outputDir, slog)
 
 	useExtractMeta := cfg.IsExtractMetadataInput()
 	var upscaleDir string
@@ -173,7 +192,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "创建 media_upscale 目录失败: %v\n", err)
 			os.Exit(2)
 		}
-		cleanupOrphanPartFiles(upscaleDir, 3600, slog)
+		cleanupStaleMediaTemps(upscaleDir, slog)
+		logMediaUpscaleResumeHint(upscaleDir, slog)
 	}
 
 	// 初始化 seen DB
@@ -204,13 +224,15 @@ func main() {
 	// 创建下载器（seen 去重在 metadata writer，与 Python 一致）
 	dl := downloader.NewDownloader(cfg)
 
-	// 创建元数据写入器（按 UTC 日单文件 metadata.jsonl；跨日轮换；seen 全局；无 S3 回调）
-	metaWriter, err := metadata.NewWriterForFile(cfg, category, metaSeen, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "创建元数据写入器失败: %v\n", err)
-		os.Exit(2)
+	var metaWriter *metadata.Writer
+	if !useExtractMeta {
+		metaWriter, err = metadata.NewWriterForFile(cfg, category, metaSeen, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "创建元数据写入器失败: %v\n", err)
+			os.Exit(2)
+		}
+		defer metaWriter.Close()
 	}
-	defer metaWriter.Close()
 
 	// 创建失败 URL 写入器
 	failedFile := cfg.ExpandPath(cfg.FailedURLsPathTemplate, category)
@@ -245,9 +267,28 @@ func main() {
 
 	// 工作队列
 	var wg sync.WaitGroup
+	var extractCP *extractCheckpoint
+
+	if useExtractMeta && !cfg.RetryFailed {
+		if inputStat, inputErr := os.Stat(cfg.Input); inputErr != nil || inputStat.IsDir() {
+			fmt.Fprintf(os.Stderr, "extract metadata 输入文件不存在: %s\n", cfg.Input)
+			os.Exit(2)
+		}
+	}
 
 	if useExtractMeta {
 		jobChan := make(chan downloadJob, 2000)
+		checkpointPath := cfg.ExpandPath(cfg.CheckpointPathTemplate, category)
+		if !cfg.RetryFailed {
+			var startLineIndex int64
+			if cfg.CheckpointInterval > 0 {
+				if path, _, idx, ok := loadExtractCheckpoint(checkpointPath); ok && path == cfg.Input {
+					startLineIndex = idx
+				}
+			}
+			cp := newExtractCheckpoint(checkpointPath, cfg.Input, cfg.CheckpointInterval, startLineIndex)
+			extractCP = cp
+		}
 		sess := &downloadSession{
 			cfg:          cfg,
 			category:     category,
@@ -255,7 +296,7 @@ func main() {
 			upscaleDir:   upscaleDir,
 			dl:           dl,
 			seenDB:       seenDB,
-			metaWriter:   metaWriter,
+			checkpoint:   extractCP,
 			upscaleSem:   make(chan struct{}, maxInt(1, cfg.UpscaleWorkers)),
 			python:       cfg.UpscalePython,
 			script:       cfg.UpscaleScript,
@@ -267,17 +308,26 @@ func main() {
 		go func() {
 			defer wg.Done()
 			defer close(jobChan)
-			checkpointPath := cfg.ExpandPath(cfg.CheckpointPathTemplate, category)
 			if cfg.RetryFailed {
+				if seenDB != nil && cfg.SeenDB.Enable {
+					n, err := emitFailedJobsFromSeenDB(seenDB, func(j downloadJob) {
+						jobChan <- j
+					})
+					if err != nil {
+						slog.log(fmt.Sprintf("retry from seen_db error: %v", err))
+						fmt.Fprintf(os.Stderr, "从 seen.db 读取 failed 记录失败: %v\n", err)
+						return
+					}
+					if n > 0 {
+						slog.log(fmt.Sprintf("retry from seen_db emitted=%d", n))
+						return
+					}
+				}
 				if !inputExists {
-					fmt.Fprintf(os.Stderr, "输入文件不存在: %s\n", inputFile)
+					fmt.Fprintf(os.Stderr, "retry_failed: seen.db 中无 failed 记录，且失败列表文件不存在: %s\n", inputFile)
 					return
 				}
 				consumeFailedURLsAsJobs(inputFile, checkpointPath, cfg.CheckpointInterval, jobChan)
-				return
-			}
-			if st, err := os.Stat(cfg.Input); err != nil || st.IsDir() {
-				slog.log(fmt.Sprintf("extract metadata not found path=%s err=%v", cfg.Input, err))
 				return
 			}
 			n, err := consumeExtractMetadataFile(cfg.Input, checkpointPath, cfg.CheckpointInterval, func(j downloadJob) {
@@ -285,6 +335,7 @@ func main() {
 			})
 			if err != nil {
 				slog.log(fmt.Sprintf("extract metadata error path=%s err=%v", cfg.Input, err))
+				fmt.Fprintf(os.Stderr, "读取 extract metadata 失败: %v\n", err)
 			} else {
 				slog.log(fmt.Sprintf("extract metadata done path=%s emitted=%d", cfg.Input, n))
 			}
@@ -324,11 +375,28 @@ func main() {
 				slog.log(fmt.Sprintf("no local shards and no urls file category=%s dir=%s input=%s", category, cfg.ExpandPath(cfg.URLsDeltaDirTemplate, category), cfg.Input))
 				return
 			}
-			if !inputExists {
-				fmt.Fprintf(os.Stderr, "输入文件不存在且未发现可消费的 delta shard: %s\n", inputFile)
+			if cfg.RetryFailed {
+				if seenDB != nil && cfg.SeenDB.Enable {
+					n, err := emitFailedURLsFromSeenDB(seenDB, func(u string) {
+						urlChan <- u
+					})
+					if err != nil {
+						slog.log(fmt.Sprintf("retry from seen_db error: %v", err))
+						fmt.Fprintf(os.Stderr, "从 seen.db 读取 failed 记录失败: %v\n", err)
+						return
+					}
+					if n > 0 {
+						slog.log(fmt.Sprintf("retry from seen_db emitted=%d", n))
+						return
+					}
+				}
+				if !inputExists {
+					fmt.Fprintf(os.Stderr, "retry_failed: seen.db 中无 failed 记录，且失败列表文件不存在: %s\n", inputFile)
+					return
+				}
+				consumeFailedURLsAsStrings(inputFile, checkpointPath, cfg.CheckpointInterval, urlChan)
 				return
 			}
-			consumeFailedURLsAsStrings(inputFile, checkpointPath, cfg.CheckpointInterval, urlChan)
 		}()
 
 		for i := 0; i < cfg.Workers; i++ {
@@ -340,8 +408,10 @@ func main() {
 						k := metadata.SeenDedupeKey(cfg, url)
 						if k != "" {
 							if ok, err := seenDB.IsOK(k); err == nil && ok {
-								bn := downloader.BaseNameForURL(cfg, url)
-								if _, err := os.Stat(filepath.Join(outputDir, bn)); err == nil {
+								continue
+							}
+							if !cfg.RetryFailed {
+								if failed, err := seenDB.IsFailed(k); err == nil && failed {
 									continue
 								}
 							}
@@ -391,6 +461,9 @@ func main() {
 
 	// 等待所有下载任务完成
 	wg.Wait()
+	if extractCP != nil {
+		extractCP.flushFinal()
+	}
 	close(failedChan)
 	failedWg.Wait()
 
@@ -460,21 +533,68 @@ func writeFilteredFile(src, dst string) (total, kept int, err error) {
 	return total, kept, scanner.Err()
 }
 
-// cleanupOrphanPartFiles 清理孤儿 .part 文件
-func cleanupOrphanPartFiles(downloadDir string, maxAgeSeconds int, slog *sessionLog) {
-	cutoff := time.Now().Add(-time.Duration(maxAgeSeconds) * time.Second)
-	matches, _ := filepath.Glob(filepath.Join(downloadDir, "*.part"))
+// cleanupStaleMediaTemps 启动时删除上一次中断/崩溃留下的临时文件：
+//   - *.part：HTTP 下载写入中的临时文件（成功后会 rename 为成品，残留即未完成）
+//   - *.up.tmp：extract 管线放大输出时的临时文件
+//
+// 注意：若在同一目录并行运行两个 download 进程，可能删掉对方正在写的临时文件；单进程常态下重启即可安全清理。
+func cleanupStaleMediaTemps(dir string, slog *sessionLog) {
+	if strings.TrimSpace(dir) == "" {
+		return
+	}
+	patterns := []string{"*.part", "*.up.tmp"}
 	removed := 0
-	for _, match := range matches {
-		if info, err := os.Stat(match); err == nil {
-			if info.ModTime().Before(cutoff) {
-				os.Remove(match)
-				removed++
+	sample := make([]string, 0, 5)
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err != nil {
+			continue
+		}
+		for _, match := range matches {
+			if err := os.Remove(match); err != nil {
+				continue
+			}
+			removed++
+			if len(sample) < 5 {
+				sample = append(sample, filepath.Base(match))
 			}
 		}
 	}
-	if removed > 0 && slog != nil {
-		slog.log(fmt.Sprintf("cleanup removed %d orphan .part file(s)", removed))
+	if removed == 0 || slog == nil {
+		return
+	}
+	msg := fmt.Sprintf("cleanup temp dir=%s removed=%d (*.part *.up.tmp)", dir, removed)
+	if len(sample) > 0 {
+		msg += fmt.Sprintf(" e.g. %v", sample)
+		if removed > len(sample) {
+			msg += " ..."
+		}
+	}
+	slog.log(msg)
+}
+
+// logMediaUpscaleResumeHint 启动时提示 media_upscale 内可能尚未放大的成品文件数量；续跑 extract 时会复用这些文件（Download 判「已存在」后直接进入 cubic）。
+func logMediaUpscaleResumeHint(upscaleDir string, slog *sessionLog) {
+	if slog == nil || strings.TrimSpace(upscaleDir) == "" {
+		return
+	}
+	entries, err := os.ReadDir(upscaleDir)
+	if err != nil {
+		return
+	}
+	n := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		low := strings.ToLower(e.Name())
+		if strings.HasSuffix(low, ".part") || strings.HasSuffix(low, ".up.tmp") {
+			continue
+		}
+		n++
+	}
+	if n > 0 {
+		slog.log(fmt.Sprintf("media_upscale: %d 个非临时文件；续跑时 JSONL 未记 ok 的行会复用本地图并继续放大到 output/media", n))
 	}
 }
 
@@ -624,7 +744,7 @@ func runMultiCategory(cfg *config.Config, slog *sessionLog) {
 			fmt.Fprintf(os.Stderr, "创建输出目录失败 %s: %v\n", outputDir, err)
 			os.Exit(2)
 		}
-		cleanupOrphanPartFiles(outputDir, 3600, slog)
+		cleanupStaleMediaTemps(outputDir, slog)
 
 		var seenDB *db.SeenDB
 		if cfg.SeenDB.Enable {

@@ -48,6 +48,7 @@ type WasabiConfig struct {
 	RetryMaxSleepMs      int `yaml:"retry_max_sleep_ms"`
 	CLIConnectTimeoutSec int `yaml:"cli_connect_timeout_sec"`
 	CLIReadTimeoutSec    int `yaml:"cli_read_timeout_sec"`
+	S3PathStyle          *bool `yaml:"s3_path_style"` // nil 自动；false=虚拟主机（腾讯云 COS）；true=路径风格
 }
 
 // UploadConfig 上传行为配置

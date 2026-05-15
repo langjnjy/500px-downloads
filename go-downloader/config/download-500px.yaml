@@ -1,12 +1,15 @@
-# 500px：从 extract metadata JSONL 下载到 output/media（HTTP + 代理，无 S3）。
+# 500px：从 extract metadata JSONL 下载到 output/media（HTTP + 代理，无 S3，不写 metadata）。
 #
 # 在仓库根执行：
 #   go build -o go-downloader/download ./go-downloader/cmd/download
 #   ./go-downloader/download -config go-downloader/config/download-500px.yaml
 #
-# 输入：output/metadata/extract_metadata_1.jsonl（每行 JSON，含 image_url / resolution）。
+# 输入：由 extract_metadata_path_template 指定单个 JSONL（每行含 image_url / resolution）。
+# 输出：仅图片文件到 media / media_upscale；不写 {date}.metadata.jsonl。
 # 分辨率满足「最短边>=1080 且 长边>=2000」→ 直存 media；否则 media_upscale → OpenCV cubic 2x → media。
-# seen.db 记录 image_url、status（ok/failed）、resolution；失败 URL 另写 failed 文件供重试。
+# seen.db 仅记录下载状态（ok/failed）；ok 表示已成功下载过（本地 media 上传 S3 后删除亦视为 ok，不重复下载）。
+# retry_failed: true 时从 seen.db 的 failed 记录重试；无 failed 时回退 failed_urls 文件。
+# checkpoint：每处理完 checkpoint_interval_lines 行（含 skipped）写入 output/checkpoints/500px_download.ckpt。
 #
 # download.retries：失败后的「额外重试」次数；retries: 3 表示最多共 4 次 HTTP 尝试。
 
@@ -51,7 +54,7 @@ download:
   skip_suffixes: [".m3u8", ".mp4"]
   use_user_agents: true
   http_user_agent: ""
-  http_pool_maxsize: 192
+  http_pool_maxsize: 200
   use_proxy: true
   proxies_yaml: "config/proxies.yaml"
   progress_interval_sec: 600
@@ -61,6 +64,6 @@ download:
   loop: false
   loop_idle_poll_seconds: 600
   retry_failed: false
-  checkpoint_interval_lines: 50000
+  checkpoint_interval_lines: 5000
   checkpoint_path_template: "output/checkpoints/500px_download.ckpt"
   failed_urls_path_template: "output/failed/500px_failed_urls.txt"

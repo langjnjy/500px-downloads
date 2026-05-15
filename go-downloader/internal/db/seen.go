@@ -105,6 +105,70 @@ ON CONFLICT(object_id) DO UPDATE SET
 	return nil
 }
 
+// FailedRow seen 表中 status=failed 的一条记录。
+type FailedRow struct {
+	ImageURL   string
+	Resolution string
+}
+
+// ListFailed 返回所有 status 为 failed 且 image_url 非空的记录。
+func (s *SeenDB) ListFailed() ([]FailedRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`
+SELECT image_url, resolution FROM seen
+WHERE lower(trim(coalesce(status,'')))='failed'
+  AND trim(coalesce(image_url,''))!=''
+ORDER BY rowid`)
+	if err != nil {
+		return nil, fmt.Errorf("list failed: %w", err)
+	}
+	defer rows.Close()
+	var out []FailedRow
+	for rows.Next() {
+		var url, res sql.NullString
+		if err := rows.Scan(&url, &res); err != nil {
+			return nil, fmt.Errorf("scan failed row: %w", err)
+		}
+		out = append(out, FailedRow{
+			ImageURL:   strings.TrimSpace(url.String),
+			Resolution: strings.TrimSpace(res.String),
+		})
+	}
+	return out, rows.Err()
+}
+
+// CountFailed 统计 status=failed 的行数。
+func (s *SeenDB) CountFailed() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	err := s.db.QueryRow(`
+SELECT COUNT(*) FROM seen
+WHERE lower(trim(coalesce(status,'')))='failed'
+  AND trim(coalesce(image_url,''))!=''`).Scan(&n)
+	return n, err
+}
+
+// IsFailed 当且仅当 status 为 failed。
+func (s *SeenDB) IsFailed(key string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oid := objectIDFromKey(key)
+	var st sql.NullString
+	err := s.db.QueryRow(`SELECT status FROM seen WHERE object_id=?`, oid).Scan(&st)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !st.Valid {
+		return false, nil
+	}
+	return strings.EqualFold(strings.TrimSpace(st.String), "failed"), nil
+}
+
 // IsOK 当且仅当 status 为 ok（忽略大小写与空白）。
 func (s *SeenDB) IsOK(key string) (bool, error) {
 	s.mu.Lock()

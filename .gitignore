@@ -13,7 +13,6 @@ build/
 
 # 敏感与本地配置（勿提交真实 Cookie）
 config/*cookies*.txt
-config/proxies.yaml
 config/*secret*
 *.pem
 
@@ -36,4 +35,5 @@ go-downloader/download
 go-downloader/*.exe
 go-downloader/coverage.out
 go-uploader/uploader
+go-uploader/go-uploader/
 go-uploader/*.exe

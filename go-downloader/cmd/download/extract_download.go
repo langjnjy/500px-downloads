@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/unsplash_downloads/go-downloader/internal/config"
 	"github.com/unsplash_downloads/go-downloader/internal/db"
@@ -25,6 +25,8 @@ type downloadJob struct {
 	HasMetaSize    bool
 	MetaW, MetaH   int
 	MetaResolution string
+	LineIndex      int64
+	ByteOffset     int64
 }
 
 func parseWXH(s string) (w, h int, err error) {
@@ -70,10 +72,49 @@ func parseExtractMetadataLine(line string) (downloadJob, bool) {
 	return j, true
 }
 
+func downloadJobFromURL(url, resolution string, lineIndex int64) downloadJob {
+	j := downloadJob{
+		URL:            url,
+		MetaResolution: resolution,
+		LineIndex:      lineIndex,
+		ByteOffset:     lineIndex + 1,
+	}
+	if w, h, err := parseWXH(resolution); err == nil && w > 0 && h > 0 {
+		j.HasMetaSize = true
+		j.MetaW, j.MetaH = w, h
+	}
+	return j
+}
+
+func emitFailedJobsFromSeenDB(seenDB *db.SeenDB, emit func(downloadJob)) (int, error) {
+	rows, err := seenDB.ListFailed()
+	if err != nil {
+		return 0, err
+	}
+	for i, row := range rows {
+		emit(downloadJobFromURL(row.ImageURL, row.Resolution, int64(i)))
+	}
+	return len(rows), nil
+}
+
+func emitFailedURLsFromSeenDB(seenDB *db.SeenDB, emit func(string)) (int, error) {
+	rows, err := seenDB.ListFailed()
+	if err != nil {
+		return 0, err
+	}
+	for _, row := range rows {
+		emit(row.ImageURL)
+	}
+	return len(rows), nil
+}
+
 func consumeExtractMetadataFile(readFile, checkpointPath string, checkpointInterval int, emit func(downloadJob)) (int, error) {
-	var startOffset int64
+	var startOffset, startLineIndex int64
 	if checkpointInterval > 0 {
-		if path, off, ok := loadCheckpoint(checkpointPath); ok && path == readFile {
+		if path, off, idx, ok := loadExtractCheckpoint(checkpointPath); ok && path == readFile {
+			startOffset = off
+			startLineIndex = idx
+		} else if path, off, ok := loadCheckpoint(checkpointPath); ok && path == readFile {
 			startOffset = off
 		}
 	}
@@ -89,7 +130,7 @@ func consumeExtractMetadataFile(readFile, checkpointPath string, checkpointInter
 	}
 	reader := bufio.NewReaderSize(file, 512*1024)
 	offset := startOffset
-	linesSinceCheckpoint := 0
+	lineIndex := startLineIndex
 	emitted := 0
 	for {
 		line, err := reader.ReadString('\n')
@@ -98,21 +139,15 @@ func consumeExtractMetadataFile(readFile, checkpointPath string, checkpointInter
 		}
 		offset += int64(len(line))
 		if job, ok := parseExtractMetadataLine(line); ok {
+			job.LineIndex = lineIndex
+			job.ByteOffset = offset
 			emit(job)
 			emitted++
-			linesSinceCheckpoint++
-			if checkpointInterval > 0 && linesSinceCheckpoint >= checkpointInterval {
-				if e := saveCheckpoint(checkpointPath, readFile, offset); e == nil {
-					linesSinceCheckpoint = 0
-				}
-			}
+			lineIndex++
 		}
 		if err == io.EOF {
 			break
 		}
-	}
-	if checkpointInterval > 0 && offset > startOffset {
-		_ = saveCheckpoint(checkpointPath, readFile, offset)
 	}
 	return emitted, nil
 }
@@ -183,7 +218,8 @@ type downloadSession struct {
 	upscaleDir   string
 	dl           *downloader.Downloader
 	seenDB       *db.SeenDB
-	metaWriter   *metadata.Writer
+	checkpoint   *extractCheckpoint
+	inflight     sync.Map
 	upscaleSem   chan struct{}
 	python       string
 	script       string
@@ -216,34 +252,77 @@ func (s *downloadSession) resolutionNote(job downloadJob, r *downloader.Download
 	return "unknown"
 }
 
-func (s *downloadSession) writeMeta(job downloadJob, fileName, resolution, timestamp, localPath string) {
-	ik := strings.TrimSpace(job.ImageKey)
-	if ik == "" {
-		ik = recordImageKey(s.cfg, s.category, fileName)
-	}
-	s.metaWriter.WriteRecord(metadata.Record{
-		ImageURL:   job.URL,
-		Resolution: resolution,
-		Timestamp:  timestamp,
-		ImageKey:   ik,
-		LocalPath:  localPath,
-	})
-}
-
 func (s *downloadSession) tierFromDims(w, h int) bool {
 	return imgmeta.MeetsMinShortMinLong(w, h, s.cfg.ResolutionMinShort, s.cfg.ResolutionMinLong)
 }
 
-func (s *downloadSession) ProcessJob(job downloadJob) {
-	dedupe := metadata.SeenDedupeKey(s.cfg, job.URL)
+type downloadOutcome int
+
+const (
+	downloadOutcomeOK downloadOutcome = iota
+	downloadOutcomeExists
+	downloadOutcomeFail
+)
+
+// classifyDownload 判断 HTTP 下载结果；Exists 表示目标目录已有同名文件（disk_glob_fallback）。
+func (s *downloadSession) classifyDownload(r *downloader.DownloadResult, dir string) downloadOutcome {
+	if r == nil {
+		return downloadOutcomeFail
+	}
+	if r.FileName != "" && r.SkipFailedList {
+		if _, err := os.Stat(filepath.Join(dir, r.FileName)); err == nil {
+			return downloadOutcomeExists
+		}
+	}
+	if r.SkippedLowRes || !r.Success {
+		return downloadOutcomeFail
+	}
+	return downloadOutcomeOK
+}
+
+func (s *downloadSession) mediaFileName(job downloadJob, r *downloader.DownloadResult) string {
+	if r != nil && strings.TrimSpace(r.FileName) != "" {
+		return r.FileName
+	}
+	return downloader.BaseNameForURL(s.cfg, job.URL)
+}
+
+func (s *downloadSession) shouldSkip(dedupe string) bool {
 	if s.seenDB != nil && s.cfg.SeenDB.Enable {
+		// ok：已下载并上传 S3 后本地文件会删除，仅以 seen.db 为准，不重复下载
 		if ok, err := s.seenDB.IsOK(dedupe); err == nil && ok {
-			bn := downloader.BaseNameForURL(s.cfg, job.URL)
-			if _, err := os.Stat(filepath.Join(s.outputDir, bn)); err == nil {
-				return
+			return true
+		}
+		// 正常模式：failed 留待 retry_failed 时重试
+		if !s.cfg.RetryFailed {
+			if failed, err := s.seenDB.IsFailed(dedupe); err == nil && failed {
+				return true
 			}
 		}
 	}
+	if _, loaded := s.inflight.LoadOrStore(dedupe, struct{}{}); loaded {
+		return true
+	}
+	return false
+}
+
+func (s *downloadSession) finishJob(job downloadJob, dedupe string) {
+	s.inflight.Delete(dedupe)
+	if s.checkpoint != nil {
+		s.checkpoint.complete(job.LineIndex, job.ByteOffset)
+	}
+}
+
+func (s *downloadSession) ProcessJob(job downloadJob) {
+	dedupe := metadata.SeenDedupeKey(s.cfg, job.URL)
+
+	if s.shouldSkip(dedupe) {
+		if s.checkpoint != nil {
+			s.checkpoint.complete(job.LineIndex, job.ByteOffset)
+		}
+		return
+	}
+	defer s.finishJob(job, dedupe)
 
 	if downloader.IsSkipURL(job.URL) {
 		s.markFailed(dedupe, job.URL, "skip_url")
@@ -257,12 +336,12 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 
 	if job.HasMetaSize && s.tierFromDims(job.MetaW, job.MetaH) {
 		r := s.dl.Download(job.URL, s.outputDir)
-		if !r.Success || r.SkippedLowRes {
+		switch s.classifyDownload(r, s.outputDir) {
+		case downloadOutcomeExists, downloadOutcomeOK:
+			s.markOK(dedupe, job.URL, s.resolutionNote(job, r))
+		default:
 			s.markFailed(dedupe, job.URL, s.resolutionNote(job, r))
-			return
 		}
-		s.markOK(dedupe, job.URL, s.resolutionNote(job, r))
-		s.writeMeta(job, r.FileName, s.resolutionNote(job, r), r.Timestamp, filepath.Join(s.outputDir, r.FileName))
 		return
 	}
 
@@ -273,9 +352,12 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 
 	if job.HasMetaSize && !s.tierFromDims(job.MetaW, job.MetaH) {
 		r := s.dl.Download(job.URL, s.upscaleDir)
-		if !r.Success || r.SkippedLowRes {
+		switch s.classifyDownload(r, s.upscaleDir) {
+		case downloadOutcomeFail:
 			s.markFailed(dedupe, job.URL, s.resolutionNote(job, r))
 			return
+		case downloadOutcomeExists, downloadOutcomeOK:
+			// 继续放大；最终 media 文件名与直存一致：{sha1(url)}.{ext}
 		}
 		if err := s.upscaleToMedia(job, r, dedupe); err != nil {
 			s.markFailed(dedupe, job.URL, job.MetaResolution+";"+err.Error())
@@ -284,18 +366,21 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 	}
 
 	r := s.dl.Download(job.URL, s.upscaleDir)
-	if !r.Success || r.SkippedLowRes {
+	switch s.classifyDownload(r, s.upscaleDir) {
+	case downloadOutcomeFail:
 		s.markFailed(dedupe, job.URL, s.resolutionNote(job, r))
 		return
+	case downloadOutcomeExists, downloadOutcomeOK:
 	}
-	src := filepath.Join(s.upscaleDir, r.FileName)
+	fileName := s.mediaFileName(job, r)
+	src := filepath.Join(s.upscaleDir, fileName)
 	w, h, err := imgmeta.DimensionsFromFile(src)
 	if err != nil {
 		_ = os.Remove(src)
 		s.markFailed(dedupe, job.URL, "decode:"+err.Error())
 		return
 	}
-	dest := filepath.Join(s.outputDir, r.FileName)
+	dest := filepath.Join(s.outputDir, fileName)
 	_ = os.Remove(dest)
 	if s.tierFromDims(w, h) {
 		if err := os.Rename(src, dest); err != nil {
@@ -305,7 +390,6 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 		}
 		fr := imgmeta.FormatResolution(w, h)
 		s.markOK(dedupe, job.URL, fr)
-		s.writeMeta(job, r.FileName, fr, r.Timestamp, dest)
 		return
 	}
 	if err := s.runCubicThenFinalize(job, r, src, dest, dedupe); err != nil {
@@ -314,7 +398,7 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 }
 
 func (s *downloadSession) upscaleToMedia(job downloadJob, r *downloader.DownloadResult, dedupe string) error {
-	fileName := r.FileName
+	fileName := s.mediaFileName(job, r)
 	src := filepath.Join(s.upscaleDir, fileName)
 	dest := filepath.Join(s.outputDir, fileName)
 	tmp := filepath.Join(s.outputDir, fileName+".up.tmp")
@@ -340,19 +424,13 @@ func (s *downloadSession) upscaleToMedia(job downloadJob, r *downloader.Download
 	if e2 != nil {
 		fr = job.MetaResolution + "_upscaled"
 	}
-	ts := strings.TrimSpace(r.Timestamp)
-	if ts == "" {
-		if st, err := os.Stat(dest); err == nil {
-			ts = st.ModTime().UTC().Format(time.RFC1123)
-		}
-	}
 	s.markOK(dedupe, job.URL, fr)
-	s.writeMeta(job, fileName, fr, ts, dest)
 	return nil
 }
 
 func (s *downloadSession) runCubicThenFinalize(job downloadJob, r *downloader.DownloadResult, src, dest, dedupe string) error {
-	tmp := filepath.Join(s.outputDir, r.FileName+".up.tmp")
+	fileName := s.mediaFileName(job, r)
+	tmp := filepath.Join(s.outputDir, fileName+".up.tmp")
 	_ = os.Remove(tmp)
 	_ = os.Remove(dest)
 	s.upscaleSem <- struct{}{}
@@ -374,13 +452,6 @@ func (s *downloadSession) runCubicThenFinalize(job downloadJob, r *downloader.Do
 	if e2 != nil {
 		fr = "upscaled"
 	}
-	ts := strings.TrimSpace(r.Timestamp)
-	if ts == "" {
-		if st, err := os.Stat(dest); err == nil {
-			ts = st.ModTime().UTC().Format(time.RFC1123)
-		}
-	}
 	s.markOK(dedupe, job.URL, fr)
-	s.writeMeta(job, r.FileName, fr, ts, dest)
 	return nil
 }

@@ -55,19 +55,35 @@ type CategoryStats struct {
 	Deleted  int64
 }
 
+// wasabiS3ForcePathStyle 是否对 S3 客户端启用路径风格（桶名在 path）。腾讯云 COS 地域 endpoint 需虚拟托管（false）。
+func wasabiS3ForcePathStyle(w *config.WasabiConfig) bool {
+	if w.S3PathStyle != nil {
+		return *w.S3PathStyle
+	}
+	ep := strings.ToLower(strings.TrimSpace(w.EndpointURL))
+	if ep == "" {
+		return false
+	}
+	if strings.Contains(ep, "myqcloud.com") {
+		return false
+	}
+	return true
+}
+
 // NewUploader 创建新的上传器
 func NewUploader(cfg *config.Config) (*Uploader, error) {
 	awsCfg := aws.Config{
-		Region:      aws.String(cfg.Wasabi.RegionName),
-		Credentials: credentials.NewSharedCredentials("", cfg.Wasabi.Profile),
+		Region:           aws.String(cfg.Wasabi.RegionName),
+		Credentials:      credentials.NewSharedCredentials("", cfg.Wasabi.Profile),
+		S3ForcePathStyle: aws.Bool(wasabiS3ForcePathStyle(&cfg.Wasabi)),
 	}
-	if strings.TrimSpace(cfg.Wasabi.EndpointURL) != "" {
-		awsCfg.Endpoint = aws.String(cfg.Wasabi.EndpointURL)
-		awsCfg.S3ForcePathStyle = aws.Bool(true)
+	if ep := strings.TrimSpace(cfg.Wasabi.EndpointURL); ep != "" {
+		awsCfg.Endpoint = aws.String(ep)
 	}
 	sess, err := session.NewSessionWithOptions(session.Options{
-		Config:  awsCfg,
-		Profile: cfg.Wasabi.Profile,
+		Config:            awsCfg,
+		Profile:           cfg.Wasabi.Profile,
+		SharedConfigState: session.SharedConfigEnable,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("创建 AWS session 失败: %w", err)
