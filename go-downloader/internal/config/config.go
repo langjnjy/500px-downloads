@@ -244,11 +244,12 @@ func mergePipelineYAML(root *pipelineRootYAML, projectRoot string) (*Config, err
 	cfg.UpscalePython = strings.TrimSpace(root.UpscalePython)
 	cfg.UpscaleWorkers = root.UpscaleWorkers
 	upsTpl := strings.TrimSpace(root.UpscaleScript)
-	if upsTpl == "" {
-		upsTpl = "scripts/upscale_cubic_2x.py"
-	}
 	cfg.UpscaleScriptTemplate = upsTpl
-	cfg.UpscaleScript = resolvePath(upsTpl, projectRoot, cat)
+	if upsTpl != "" {
+		cfg.UpscaleScript = resolvePath(upsTpl, projectRoot, cat)
+	} else {
+		cfg.UpscaleScript = ""
+	}
 	if strings.TrimSpace(cfg.MediaUpscaleDirTemplate) != "" {
 		cfg.MediaUpscaleDir = resolvePath(cfg.MediaUpscaleDirTemplate, projectRoot, cat)
 	}
@@ -448,9 +449,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if strings.TrimSpace(cfg.UpscaleScript) == "" && strings.TrimSpace(cfg.UpscaleScriptTemplate) != "" {
 		cfg.UpscaleScript = resolvePath(cfg.UpscaleScriptTemplate, cfg.ProjectRoot, cfg.Category)
-	}
-	if strings.TrimSpace(cfg.UpscaleScript) == "" {
-		cfg.UpscaleScript = resolvePath("scripts/upscale_cubic_2x.py", cfg.ProjectRoot, cfg.Category)
 	}
 }
 

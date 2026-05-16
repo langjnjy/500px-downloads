@@ -329,11 +329,6 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 		return
 	}
 
-	if s.cfg.UpscaleScript == "" && (!job.HasMetaSize || !s.tierFromDims(job.MetaW, job.MetaH)) {
-		s.markFailed(dedupe, job.URL, "no_upscale_script")
-		return
-	}
-
 	if job.HasMetaSize && s.tierFromDims(job.MetaW, job.MetaH) {
 		r := s.dl.Download(job.URL, s.outputDir)
 		switch s.classifyDownload(r, s.outputDir) {

@@ -22,8 +22,8 @@ extract_metadata_path_template: "output/metadata/extract_metadata_1.jsonl"
 media_upscale_dir_template: "output/media_upscale"
 resolution_min_short: 1080
 resolution_min_long: 2000
-upscale_python: "python3"
-upscale_script: "scripts/upscale_cubic_2x.py"
+# 以下为可选。省略时：内置 CGO+OpenCV 放大；upscale_workers 默认 4。
+# upscale_python / upscale_script 已弃用（保留字段仅为兼容旧 yaml）。
 upscale_workers: 8
 
 include_categories:
