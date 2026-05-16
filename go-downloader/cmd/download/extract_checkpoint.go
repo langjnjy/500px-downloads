@@ -56,6 +56,19 @@ func (c *extractCheckpoint) complete(lineIndex, byteOffset int64) {
 	}
 }
 
+func (c *extractCheckpoint) resetForFile(readFile string, startLineIndex int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readFile = readFile
+	c.nextLineIndex = startLineIndex
+	c.pending = make(map[int64]int64)
+	c.linesSinceSave = 0
+	c.lastSavedOffset = 0
+}
+
 func (c *extractCheckpoint) flushFinal() {
 	if c == nil || c.interval <= 0 {
 		return

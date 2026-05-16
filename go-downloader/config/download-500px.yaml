@@ -4,7 +4,9 @@
 #   go build -o go-downloader/download ./go-downloader/cmd/download
 #   ./go-downloader/download -config go-downloader/config/download-500px.yaml
 #
-# 输入：由 extract_metadata_path_template 指定单个 JSONL（每行含 image_url / resolution）。
+# 输入（二选一）：
+#   1. 配置 extract_metadata_path_template → 仅下载该文件
+#   2. 不配置 → 自动扫描 output/metadata/extract_metadata_<n>.jsonl，多个按 n 升序依次下载
 # 输出：仅图片文件到 media / media_upscale；不写 {date}.metadata.jsonl。
 # 分辨率满足「最短边>=1080 且 长边>=2000」→ 直存 media；否则 media_upscale → OpenCV cubic 2x → media。
 # seen.db 仅记录下载状态（ok/failed）；ok 表示已成功下载过（本地 media 上传 S3 后删除亦视为 ok，不重复下载）。
@@ -18,7 +20,7 @@ image_key_prefix: "500px-downloads/media"
 image_key_style: "crawl_hash"
 
 input_mode: "extract_metadata"
-extract_metadata_path_template: "output/metadata/extract_metadata_1.jsonl"
+# extract_metadata_path_template: "output/metadata/extract_metadata_1.jsonl"
 media_upscale_dir_template: "output/media_upscale"
 resolution_min_short: 1080
 resolution_min_long: 2000
@@ -63,7 +65,7 @@ download:
   metadata_flush_interval_sec: 15
   loop: false
   loop_idle_poll_seconds: 600
-  retry_failed: false
+  retry_failed: true
   checkpoint_interval_lines: 5000
   checkpoint_path_template: "output/checkpoints/500px_download.ckpt"
   failed_urls_path_template: "output/failed/500px_failed_urls.txt"

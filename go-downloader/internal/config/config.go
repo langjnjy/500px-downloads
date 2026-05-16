@@ -31,6 +31,7 @@ type Config struct {
 	ImageKeyStyle             string             `yaml:"image_key_style"`
 	InputMode                 string             `yaml:"input_mode"`
 	ExtractMetadataPathTemplate string           `yaml:"extract_metadata_path_template"`
+	ExtractMetadataInputs       []string         `yaml:"-"`
 	MediaUpscaleDirTemplate   string             `yaml:"media_upscale_dir_template"`
 	MediaUpscaleDir           string             `yaml:"-"`
 	ResolutionMinShort        int                `yaml:"resolution_min_short"`
@@ -256,10 +257,20 @@ func mergePipelineYAML(root *pipelineRootYAML, projectRoot string) (*Config, err
 
 	if strings.EqualFold(cfg.InputMode, "extract_metadata") {
 		metaTpl := cfg.ExtractMetadataPathTemplate
-		if metaTpl == "" {
-			metaTpl = "output/metadata/extract_metadata_1.jsonl"
+		if metaTpl != "" {
+			p := resolvePath(metaTpl, projectRoot, cat)
+			cfg.ExtractMetadataInputs = []string{p}
+			cfg.Input = p
+		} else {
+			files, err := DiscoverExtractMetadataFiles(projectRoot)
+			if err != nil {
+				return nil, err
+			}
+			if len(files) > 0 {
+				cfg.ExtractMetadataInputs = files
+				cfg.Input = files[0]
+			}
 		}
-		cfg.Input = resolvePath(metaTpl, projectRoot, cat)
 	} else {
 		cfg.Input = resolvePath(root.URLsPathTemplate, projectRoot, cat)
 	}

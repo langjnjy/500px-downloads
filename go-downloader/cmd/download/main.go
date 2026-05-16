@@ -270,9 +270,22 @@ func main() {
 	var extractCP *extractCheckpoint
 
 	if useExtractMeta && !cfg.RetryFailed {
-		if inputStat, inputErr := os.Stat(cfg.Input); inputErr != nil || inputStat.IsDir() {
-			fmt.Fprintf(os.Stderr, "extract metadata 输入文件不存在: %s\n", cfg.Input)
+		if len(cfg.ExtractMetadataInputs) == 0 {
+			fmt.Fprintf(os.Stderr,
+				"未找到 extract metadata 输入：请配置 extract_metadata_path_template，或在 output/metadata 下放置 extract_metadata_<n>.jsonl\n")
 			os.Exit(2)
+		}
+		for _, p := range cfg.ExtractMetadataInputs {
+			if inputStat, inputErr := os.Stat(p); inputErr != nil || inputStat.IsDir() {
+				fmt.Fprintf(os.Stderr, "extract metadata 输入文件不存在: %s\n", p)
+				os.Exit(2)
+			}
+		}
+		if len(cfg.ExtractMetadataInputs) > 1 {
+			fmt.Fprintf(os.Stderr, "extract metadata 输入（按 n 升序）共 %d 个:\n", len(cfg.ExtractMetadataInputs))
+			for _, p := range cfg.ExtractMetadataInputs {
+				fmt.Fprintf(os.Stderr, "  %s\n", p)
+			}
 		}
 	}
 
@@ -280,13 +293,20 @@ func main() {
 		jobChan := make(chan downloadJob, 2000)
 		checkpointPath := cfg.ExpandPath(cfg.CheckpointPathTemplate, category)
 		if !cfg.RetryFailed {
+			startFile := cfg.ExtractMetadataInputs[0]
 			var startLineIndex int64
 			if cfg.CheckpointInterval > 0 {
-				if path, _, idx, ok := loadExtractCheckpoint(checkpointPath); ok && path == cfg.Input {
-					startLineIndex = idx
+				if path, _, idx, ok := loadExtractCheckpoint(checkpointPath); ok {
+					for _, f := range cfg.ExtractMetadataInputs {
+						if f == path {
+							startFile = path
+							startLineIndex = idx
+							break
+						}
+					}
 				}
 			}
-			cp := newExtractCheckpoint(checkpointPath, cfg.Input, cfg.CheckpointInterval, startLineIndex)
+			cp := newExtractCheckpoint(checkpointPath, startFile, cfg.CheckpointInterval, startLineIndex)
 			extractCP = cp
 		}
 		sess := &downloadSession{
@@ -330,14 +350,14 @@ func main() {
 				consumeFailedURLsAsJobs(inputFile, checkpointPath, cfg.CheckpointInterval, jobChan)
 				return
 			}
-			n, err := consumeExtractMetadataFile(cfg.Input, checkpointPath, cfg.CheckpointInterval, func(j downloadJob) {
+			n, err := consumeExtractMetadataFiles(cfg.ExtractMetadataInputs, checkpointPath, cfg.CheckpointInterval, extractCP, sess, func(j downloadJob) {
 				jobChan <- j
 			})
 			if err != nil {
-				slog.log(fmt.Sprintf("extract metadata error path=%s err=%v", cfg.Input, err))
+				slog.log(fmt.Sprintf("extract metadata error err=%v", err))
 				fmt.Fprintf(os.Stderr, "读取 extract metadata 失败: %v\n", err)
 			} else {
-				slog.log(fmt.Sprintf("extract metadata done path=%s emitted=%d", cfg.Input, n))
+				slog.log(fmt.Sprintf("extract metadata done files=%d emitted=%d", len(cfg.ExtractMetadataInputs), n))
 			}
 		}()
 

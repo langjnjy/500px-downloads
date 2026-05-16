@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/unsplash_downloads/go-downloader/internal/config"
 	"github.com/unsplash_downloads/go-downloader/internal/db"
@@ -118,6 +119,10 @@ func consumeExtractMetadataFile(readFile, checkpointPath string, checkpointInter
 			startOffset = off
 		}
 	}
+	return consumeExtractMetadataFileFrom(readFile, startOffset, startLineIndex, emit)
+}
+
+func consumeExtractMetadataFileFrom(readFile string, startOffset, startLineIndex int64, emit func(downloadJob)) (int, error) {
 	file, err := os.Open(readFile)
 	if err != nil {
 		return 0, err
@@ -150,6 +155,51 @@ func consumeExtractMetadataFile(readFile, checkpointPath string, checkpointInter
 		}
 	}
 	return emitted, nil
+}
+
+func consumeExtractMetadataFiles(files []string, checkpointPath string, checkpointInterval int, cp *extractCheckpoint, sess *downloadSession, emit func(downloadJob)) (int, error) {
+	if len(files) == 0 {
+		return 0, fmt.Errorf("无 extract metadata 输入文件")
+	}
+	startIdx := 0
+	var startOffset, startLineIndex int64
+	if checkpointInterval > 0 {
+		if path, off, idx, ok := loadExtractCheckpoint(checkpointPath); ok {
+			for i, f := range files {
+				if f == path {
+					startIdx = i
+					startOffset = off
+					startLineIndex = idx
+					break
+				}
+			}
+		}
+	}
+	total := 0
+	for i := startIdx; i < len(files); i++ {
+		readFile := files[i]
+		off := int64(0)
+		lineIdx := int64(0)
+		if i == startIdx {
+			off = startOffset
+			lineIdx = startLineIndex
+		}
+		if cp != nil {
+			cp.resetForFile(readFile, lineIdx)
+		}
+		n, err := consumeExtractMetadataFileFrom(readFile, off, lineIdx, emit)
+		total += n
+		if err != nil {
+			return total, fmt.Errorf("%s: %w", readFile, err)
+		}
+		if sess != nil {
+			sess.waitInflight()
+		}
+		if cp != nil {
+			cp.flushFinal()
+		}
+	}
+	return total, nil
 }
 
 func consumeFailedURLsAsStrings(readFile, checkpointPath string, checkpointInterval int, urlChan chan<- string) {
@@ -304,6 +354,20 @@ func (s *downloadSession) shouldSkip(dedupe string) bool {
 		return true
 	}
 	return false
+}
+
+func (s *downloadSession) waitInflight() {
+	for {
+		busy := false
+		s.inflight.Range(func(_, _ interface{}) bool {
+			busy = true
+			return false
+		})
+		if !busy {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (s *downloadSession) finishJob(job downloadJob, dedupe string) {
