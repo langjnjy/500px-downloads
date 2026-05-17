@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/unsplash_downloads/go-downloader/internal/config"
@@ -29,6 +30,8 @@ type downloadJob struct {
 	MetaResolution string
 	LineIndex      int64
 	ByteOffset     int64
+	// SkipCheckpoint 为 true 时不更新 extract JSONL 断点（如从 seen 排空 pending_upscale / pending_large 的任务）。
+	SkipCheckpoint bool
 }
 
 func parseWXH(s string) (w, h int, err error) {
@@ -104,15 +107,78 @@ func downloadJobFromURL(url, resolution string, lineIndex int64) downloadJob {
 	return j
 }
 
-func emitFailedJobsFromSeenDB(seenDB *db.SeenDB, emit func(downloadJob)) (int, error) {
-	rows, err := seenDB.ListFailed()
+func emitPendingUpscaleFromSeenDB(seenDB *db.SeenDB, emit func(downloadJob)) (int, error) {
+	rows, err := seenDB.ListPendingUpscale()
 	if err != nil {
 		return 0, err
 	}
-	for i, row := range rows {
-		emit(downloadJobFromURL(row.ImageURL, row.Resolution, int64(i)))
+	for _, row := range rows {
+		j := downloadJobFromURL(row.ImageURL, strings.TrimSpace(row.Detail), -1)
+		j.SkipCheckpoint = true
+		emit(j)
 	}
 	return len(rows), nil
+}
+
+func emitPendingLargeFromSeenDB(seenDB *db.SeenDB, emit func(downloadJob)) (int, error) {
+	rows, err := seenDB.ListPendingLarge()
+	if err != nil {
+		return 0, err
+	}
+	for _, row := range rows {
+		j := downloadJobFromURL(row.ImageURL, strings.TrimSpace(row.Detail), -1)
+		j.SkipCheckpoint = true
+		emit(j)
+	}
+	return len(rows), nil
+}
+
+// emitPendingDrainByPolicy 按批策略排空 seen.db 中的 pending 队列；full 时两者都排空。
+func emitPendingDrainByPolicy(policy string, seenDB *db.SeenDB, emit func(downloadJob)) (upscaleN, largeN int, err error) {
+	pol := strings.ToLower(strings.TrimSpace(policy))
+	if pol == "metadata_small" || pol == "full" {
+		upscaleN, err = emitPendingUpscaleFromSeenDB(seenDB, emit)
+		if err != nil {
+			return upscaleN, largeN, err
+		}
+	}
+	if pol == "metadata_large" || pol == "full" {
+		largeN, err = emitPendingLargeFromSeenDB(seenDB, emit)
+	}
+	return upscaleN, largeN, err
+}
+
+func emitFailedJobsFromSeenDB(seenDB *db.SeenDB, extractPolicy string, emit func(downloadJob)) (emitted int, totalFailed int, err error) {
+	rows, err := seenDB.ListFailed()
+	if err != nil {
+		return 0, 0, err
+	}
+	totalFailed = len(rows)
+	for i, row := range rows {
+		if !db.FailedRowMatchesRetryPolicy(extractPolicy, row.Route) {
+			continue
+		}
+		emit(downloadJobFromSeenFailedRow(row.ImageURL, row.Route, row.Detail, int64(i)))
+		emitted++
+	}
+	return emitted, totalFailed, nil
+}
+
+// downloadJobFromSeenFailedRow 从 seen 失败行的 detail（及兼容旧库的 route 拼串）恢复 job，解析 | 分段中的 WxH。
+func downloadJobFromSeenFailedRow(url, route, detail string, lineIndex int64) downloadJob {
+	for _, part := range strings.Split(detail, "|") {
+		p := strings.TrimSpace(part)
+		if w, h, err := parseWXH(p); err == nil && w > 0 && h > 0 {
+			return downloadJobFromURL(url, p, lineIndex)
+		}
+	}
+	for _, part := range strings.Split(route, "|") {
+		p := strings.TrimSpace(part)
+		if w, h, err := parseWXH(p); err == nil && w > 0 && h > 0 {
+			return downloadJobFromURL(url, p, lineIndex)
+		}
+	}
+	return downloadJobFromURL(url, "", lineIndex)
 }
 
 func emitFailedURLsFromSeenDB(seenDB *db.SeenDB, emit func(string)) (int, error) {
@@ -286,26 +352,28 @@ type downloadSession struct {
 	dl           *downloader.Downloader
 	seenDB       *db.SeenDB
 	checkpoint   *extractCheckpoint
-	inflight     sync.Map
-	upscaleSem   chan struct{}
-	python       string
-	script       string
-	appendFailed bool
-	failedChan   chan<- string
+	// extractInflight 仅在多 JSONL 顺序扫描时非 nil：每入队一任务 +1，ProcessJob 退出时 -1，用于切换下一文件前排空队列。
+	extractInflight *atomic.Int64
+	inflight        sync.Map
+	upscaleSem      chan struct{}
+	python          string
+	script          string
+	appendFailed    bool
+	failedChan      chan<- string
 }
 
-func (s *downloadSession) markFailed(dedupeKey, imageURL, resolution string) {
+func (s *downloadSession) markFailed(dedupeKey, imageURL, route, detail string) {
 	if s.seenDB != nil && s.cfg.SeenDB.Enable {
-		_ = s.seenDB.Upsert(dedupeKey, imageURL, "failed", resolution)
+		_ = s.seenDB.Upsert(dedupeKey, imageURL, "failed", route, detail)
 	}
 	if s.appendFailed {
 		s.failedChan <- imageURL
 	}
 }
 
-func (s *downloadSession) markOK(dedupeKey, imageURL, resolution string) {
+func (s *downloadSession) markOK(dedupeKey, imageURL, route string) {
 	if s.seenDB != nil && s.cfg.SeenDB.Enable {
-		_ = s.seenDB.Upsert(dedupeKey, imageURL, "ok", resolution)
+		_ = s.seenDB.Upsert(dedupeKey, imageURL, "ok", route, "")
 	}
 }
 
@@ -317,6 +385,26 @@ func (s *downloadSession) resolutionNote(job downloadJob, r *downloader.Download
 		return job.MetaResolution
 	}
 	return "unknown"
+}
+
+func truncateSeenDetail(s string, max int) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max]
+}
+
+func formatLargeDirectDetail(job downloadJob, note string) string {
+	meta := strings.TrimSpace(job.MetaResolution)
+	if meta == "" {
+		meta = "-"
+	}
+	return meta + "|" + truncateSeenDetail(note, 240)
+}
+
+func formatCV2Detail(note string) string {
+	return truncateSeenDetail(note, 320)
 }
 
 func (s *downloadSession) tierFromDims(w, h int) bool {
@@ -369,6 +457,18 @@ func (s *downloadSession) shouldSkip(dedupe string) bool {
 		if ok, err := s.seenDB.IsOK(dedupe); err == nil && ok {
 			return true
 		}
+		// metadata_large：已记入 pending_upscale 的小图行不重扫（待 metadata_small 排空）
+		if s.cfg.IsExtractMetadataLargeBatch() && !s.cfg.RetryFailed {
+			if pending, err := s.seenDB.IsPendingUpscale(dedupe); err == nil && pending {
+				return true
+			}
+		}
+		// metadata_small：已记入 pending_large 的大图行不重扫（待 metadata_large 排空）
+		if s.cfg.IsExtractMetadataSmallBatch() && !s.cfg.RetryFailed {
+			if pending, err := s.seenDB.IsPendingLarge(dedupe); err == nil && pending {
+				return true
+			}
+		}
 		// 正常模式：failed 留待 retry_failed 时重试
 		if !s.cfg.RetryFailed {
 			if failed, err := s.seenDB.IsFailed(dedupe); err == nil && failed {
@@ -398,12 +498,15 @@ func (s *downloadSession) waitInflight() {
 
 func (s *downloadSession) finishJob(job downloadJob, dedupe string) {
 	s.inflight.Delete(dedupe)
-	if s.checkpoint != nil {
+	if s.checkpoint != nil && !job.SkipCheckpoint {
 		s.checkpoint.complete(job.LineIndex, job.ByteOffset)
 	}
 }
 
 func (s *downloadSession) ProcessJob(job downloadJob) {
+	if s.extractInflight != nil {
+		defer s.extractInflight.Add(-1)
+	}
 	dedupe := metadata.SeenDedupeKey(s.cfg, job.URL)
 
 	if s.shouldSkip(dedupe) {
@@ -415,37 +518,70 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 	defer s.finishJob(job, dedupe)
 
 	if downloader.IsSkipURL(job.URL) {
-		s.markFailed(dedupe, job.URL, "skip_url")
+		s.markFailed(dedupe, job.URL, "", "skip_url")
 		return
 	}
 
+	lg := s.cfg.IsExtractMetadataLargeBatch()
+	sm := s.cfg.IsExtractMetadataSmallBatch()
+	retry := s.cfg.RetryFailed
+	// full 批（及 retry_failed）当场处理，不写 pending_*；两阶段批按 lg/sm 推迟到 pending。
+
+	// 元数据已满足阈值 → 大图批/full/retry 直下 media；小图批推迟到 pending_large
 	if job.HasMetaSize && s.tierFromDims(job.MetaW, job.MetaH) {
+		if sm && !retry {
+			if s.seenDB != nil && s.cfg.SeenDB.Enable {
+				_ = s.seenDB.Upsert(dedupe, job.URL, db.StatusPendingLarge, db.SeenResolutionLargeDirect, strings.TrimSpace(job.MetaResolution))
+			} else {
+				fmt.Fprintf(os.Stderr, "警告: metadata_small 需启用 metadata_seen_db，否则无法记录待大图 URL: %s\n", job.URL)
+			}
+			return
+		}
 		r := s.downloadExtract(job, s.outputDir)
 		switch s.classifyDownload(r, s.outputDir) {
 		case downloadOutcomeExists, downloadOutcomeOK:
-			s.markOK(dedupe, job.URL, s.resolutionNote(job, r))
+			s.markOK(dedupe, job.URL, db.SeenResolutionLargeDirect)
 		default:
-			s.markFailed(dedupe, job.URL, s.resolutionNote(job, r))
+			s.markFailed(dedupe, job.URL, db.SeenResolutionLargeDirect, formatLargeDirectDetail(job, s.resolutionNote(job, r)))
 		}
 		return
 	}
 
 	if err := os.MkdirAll(s.upscaleDir, 0755); err != nil {
-		s.markFailed(dedupe, job.URL, "mkdir_upscale:"+err.Error())
+		s.markFailed(dedupe, job.URL, db.SeenResolutionCV2Upscale, formatCV2Detail("mkdir_upscale:"+err.Error()))
 		return
 	}
 
+	// 元数据低于阈值 → 大图批推迟到 pending_upscale；小图批走下载+CV2
 	if job.HasMetaSize && !s.tierFromDims(job.MetaW, job.MetaH) {
+		if lg && !retry {
+			if s.seenDB != nil && s.cfg.SeenDB.Enable {
+				_ = s.seenDB.Upsert(dedupe, job.URL, db.StatusPendingUpscale, db.SeenResolutionCV2Upscale, strings.TrimSpace(job.MetaResolution))
+			} else {
+				fmt.Fprintf(os.Stderr, "警告: metadata_large 需启用 metadata_seen_db，否则无法记录待 CV2 URL: %s\n", job.URL)
+			}
+			return
+		}
 		r := s.downloadExtract(job, s.upscaleDir)
 		switch s.classifyDownload(r, s.upscaleDir) {
 		case downloadOutcomeFail:
-			s.markFailed(dedupe, job.URL, s.resolutionNote(job, r))
+			s.markFailed(dedupe, job.URL, db.SeenResolutionCV2Upscale, formatCV2Detail(s.resolutionNote(job, r)))
 			return
 		case downloadOutcomeExists, downloadOutcomeOK:
 			// 继续放大；最终 media 文件名与直存一致：{sha1(url)}.{ext}
 		}
 		if err := s.upscaleToMedia(job, r, dedupe); err != nil {
-			s.markFailed(dedupe, job.URL, job.MetaResolution+";"+err.Error())
+			s.markFailed(dedupe, job.URL, db.SeenResolutionCV2Upscale, formatCV2Detail(job.MetaResolution+";"+err.Error()))
+		}
+		return
+	}
+
+	// JSONL 无可用 WxH：大图批推迟给 small 探测；小图批/重试则下载探测
+	if lg && !retry {
+		if s.seenDB != nil && s.cfg.SeenDB.Enable {
+			_ = s.seenDB.Upsert(dedupe, job.URL, db.StatusPendingUpscale, db.SeenResolutionCV2Upscale, "nometa")
+		} else {
+			fmt.Fprintf(os.Stderr, "警告: metadata_large 需启用 metadata_seen_db，否则无法记录无 resolution 行: %s\n", job.URL)
 		}
 		return
 	}
@@ -453,7 +589,7 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 	r := s.downloadExtract(job, s.upscaleDir)
 	switch s.classifyDownload(r, s.upscaleDir) {
 	case downloadOutcomeFail:
-		s.markFailed(dedupe, job.URL, s.resolutionNote(job, r))
+		s.markFailed(dedupe, job.URL, db.SeenResolutionCV2Upscale, formatCV2Detail(s.resolutionNote(job, r)))
 		return
 	case downloadOutcomeExists, downloadOutcomeOK:
 	}
@@ -462,7 +598,7 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 	w, h, err := imgmeta.DimensionsFromFile(src)
 	if err != nil {
 		_ = os.Remove(src)
-		s.markFailed(dedupe, job.URL, "decode:"+err.Error())
+		s.markFailed(dedupe, job.URL, db.SeenResolutionCV2Upscale, formatCV2Detail("decode:"+err.Error()))
 		return
 	}
 	dest := filepath.Join(s.outputDir, fileName)
@@ -470,23 +606,31 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 	if s.tierFromDims(w, h) {
 		if err := os.Rename(src, dest); err != nil {
 			_ = os.Remove(src)
-			s.markFailed(dedupe, job.URL, imgmeta.FormatResolution(w, h)+";"+err.Error())
+			s.markFailed(dedupe, job.URL, db.SeenResolutionCV2Upscale, formatCV2Detail(imgmeta.FormatResolution(w, h)+";"+err.Error()))
 			return
 		}
-		fr := imgmeta.FormatResolution(w, h)
-		s.markOK(dedupe, job.URL, fr)
+		s.markOK(dedupe, job.URL, db.SeenResolutionLargeDirect)
 		return
 	}
 	if err := s.runCubicThenFinalize(job, r, src, dest, dedupe); err != nil {
-		s.markFailed(dedupe, job.URL, imgmeta.FormatResolution(w, h)+";"+err.Error())
+		s.markFailed(dedupe, job.URL, db.SeenResolutionCV2Upscale, formatCV2Detail(imgmeta.FormatResolution(w, h)+";"+err.Error()))
 	}
+}
+
+// upscaleTempPath 生成放大临时路径。OpenCV imwrite 按最终扩展名选编码器，须为 *.up.tmp.jpg 而非 *.jpg.up.tmp。
+func upscaleTempPath(finalPath string) string {
+	ext := filepath.Ext(finalPath)
+	if ext == "" {
+		return finalPath + ".up.tmp.jpg"
+	}
+	return strings.TrimSuffix(finalPath, ext) + ".up.tmp" + ext
 }
 
 func (s *downloadSession) upscaleToMedia(job downloadJob, r *downloader.DownloadResult, dedupe string) error {
 	fileName := s.mediaFileName(job, r)
 	src := filepath.Join(s.upscaleDir, fileName)
 	dest := filepath.Join(s.outputDir, fileName)
-	tmp := filepath.Join(s.outputDir, fileName+".up.tmp")
+	tmp := upscaleTempPath(dest)
 	_ = os.Remove(tmp)
 	_ = os.Remove(dest)
 
@@ -504,18 +648,12 @@ func (s *downloadSession) upscaleToMedia(job downloadJob, r *downloader.Download
 		return err
 	}
 	_ = os.Remove(src)
-	fw, fh, e2 := imgmeta.DimensionsFromFile(dest)
-	fr := imgmeta.FormatResolution(fw, fh)
-	if e2 != nil {
-		fr = job.MetaResolution + "_upscaled"
-	}
-	s.markOK(dedupe, job.URL, fr)
+	s.markOK(dedupe, job.URL, db.SeenResolutionCV2Upscale)
 	return nil
 }
 
 func (s *downloadSession) runCubicThenFinalize(job downloadJob, r *downloader.DownloadResult, src, dest, dedupe string) error {
-	fileName := s.mediaFileName(job, r)
-	tmp := filepath.Join(s.outputDir, fileName+".up.tmp")
+	tmp := upscaleTempPath(dest)
 	_ = os.Remove(tmp)
 	_ = os.Remove(dest)
 	s.upscaleSem <- struct{}{}
@@ -532,11 +670,6 @@ func (s *downloadSession) runCubicThenFinalize(job downloadJob, r *downloader.Do
 		return err
 	}
 	_ = os.Remove(src)
-	fw, fh, e2 := imgmeta.DimensionsFromFile(dest)
-	fr := imgmeta.FormatResolution(fw, fh)
-	if e2 != nil {
-		fr = "upscaled"
-	}
-	s.markOK(dedupe, job.URL, fr)
+	s.markOK(dedupe, job.URL, db.SeenResolutionCV2Upscale)
 	return nil
 }

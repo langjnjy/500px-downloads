@@ -194,6 +194,11 @@ func main() {
 		}
 		cleanupStaleMediaTemps(upscaleDir, slog)
 		logMediaUpscaleResumeHint(upscaleDir, slog)
+		if !cfg.SeenDB.Enable {
+			if _, err := cfg.NormalizedExtractMetadataResolutionPolicy(); err == nil {
+				fmt.Fprintf(os.Stderr, "警告: extract_metadata 批策略需要启用 metadata_seen_db，否则无法记录 pending_upscale / pending_large。\n")
+			}
+		}
 	}
 
 	// 初始化 seen DB
@@ -330,7 +335,32 @@ func main() {
 			defer close(jobChan)
 			if cfg.RetryFailed {
 				if seenDB != nil && cfg.SeenDB.Enable {
-					n, err := emitFailedJobsFromSeenDB(seenDB, func(j downloadJob) {
+					retryPol, polErr := cfg.NormalizedExtractMetadataResolutionPolicy()
+					if polErr == nil {
+						npUp, npLarge, err := emitPendingDrainByPolicy(retryPol, seenDB, func(j downloadJob) {
+							jobChan <- j
+						})
+						if err != nil {
+							slog.log(fmt.Sprintf("drain pending error: %v", err))
+							fmt.Fprintf(os.Stderr, "读取 pending_upscale/pending_large 失败: %v\n", err)
+						} else {
+							if npUp > 0 {
+								slog.log(fmt.Sprintf("drain pending_upscale emitted=%d (retry_failed 前排空)", npUp))
+							}
+							if npLarge > 0 {
+								slog.log(fmt.Sprintf("drain pending_large emitted=%d (retry_failed 前排空)", npLarge))
+							}
+						}
+					}
+				}
+				if seenDB != nil && cfg.SeenDB.Enable {
+					retryPol, polErr := cfg.NormalizedExtractMetadataResolutionPolicy()
+					if polErr != nil {
+						slog.log(fmt.Sprintf("retry policy error: %v", polErr))
+						fmt.Fprintf(os.Stderr, "extract_metadata_resolution_policy 无效: %v\n", polErr)
+						return
+					}
+					n, nFailedSeen, err := emitFailedJobsFromSeenDB(seenDB, retryPol, func(j downloadJob) {
 						jobChan <- j
 					})
 					if err != nil {
@@ -339,7 +369,11 @@ func main() {
 						return
 					}
 					if n > 0 {
-						slog.log(fmt.Sprintf("retry from seen_db emitted=%d", n))
+						slog.log(fmt.Sprintf("retry from seen_db emitted=%d (policy=%s)", n, retryPol))
+						return
+					}
+					if nFailedSeen > 0 && !cfg.IsExtractMetadataFullBatch() && (cfg.IsExtractMetadataLargeBatch() || cfg.IsExtractMetadataSmallBatch()) {
+						slog.log(fmt.Sprintf("retry_failed: seen 有 %d 条 failed 但与当前批策略(%s)所需 route 不匹配，跳过 failed_urls 回退", nFailedSeen, retryPol))
 						return
 					}
 				}
@@ -349,6 +383,25 @@ func main() {
 				}
 				consumeFailedURLsAsJobs(inputFile, checkpointPath, cfg.CheckpointInterval, jobChan)
 				return
+			}
+			if seenDB != nil && cfg.SeenDB.Enable {
+				startPol, polErr := cfg.NormalizedExtractMetadataResolutionPolicy()
+				if polErr == nil {
+					npUp, npLarge, err := emitPendingDrainByPolicy(startPol, seenDB, func(j downloadJob) {
+						jobChan <- j
+					})
+					if err != nil {
+						slog.log(fmt.Sprintf("drain pending error: %v", err))
+						fmt.Fprintf(os.Stderr, "读取 pending_upscale/pending_large 失败: %v\n", err)
+					} else {
+						if npUp > 0 {
+							slog.log(fmt.Sprintf("drain pending_upscale emitted=%d (启动排空)", npUp))
+						}
+						if npLarge > 0 {
+							slog.log(fmt.Sprintf("drain pending_large emitted=%d (启动排空)", npLarge))
+						}
+					}
+				}
 			}
 			n, err := consumeExtractMetadataFiles(cfg.ExtractMetadataInputs, checkpointPath, cfg.CheckpointInterval, extractCP, sess, func(j downloadJob) {
 				jobChan <- j
@@ -562,7 +615,7 @@ func cleanupStaleMediaTemps(dir string, slog *sessionLog) {
 	if strings.TrimSpace(dir) == "" {
 		return
 	}
-	patterns := []string{"*.part", "*.up.tmp"}
+	patterns := []string{"*.part", "*.up.tmp", "*.up.tmp.*"}
 	removed := 0
 	sample := make([]string, 0, 5)
 	for _, pattern := range patterns {
@@ -608,7 +661,7 @@ func logMediaUpscaleResumeHint(upscaleDir string, slog *sessionLog) {
 			continue
 		}
 		low := strings.ToLower(e.Name())
-		if strings.HasSuffix(low, ".part") || strings.HasSuffix(low, ".up.tmp") {
+		if strings.HasSuffix(low, ".part") || strings.Contains(low, ".up.tmp") {
 			continue
 		}
 		n++

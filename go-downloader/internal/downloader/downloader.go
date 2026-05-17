@@ -154,7 +154,7 @@ func (d *Downloader) DownloadExtract(opts DownloadExtractOpts, downloadDir strin
 
 	if d.cfg.DiskGlobFallback {
 		matches, _ := filepath.Glob(filepath.Join(downloadDir, fmt.Sprintf("%s.*", objectID)))
-		if len(matches) > 0 {
+		if HasCompleteDownload(matches) {
 			atomic.AddInt64(&d.stats.Skipped, 1)
 			return &DownloadResult{Success: false, FileName: fileName, ObjectID: objectID, SkipFailedList: true}
 		}
@@ -352,6 +352,18 @@ func (d *Downloader) GetStats() (int64, int64, int64) {
 func sha1Hex(s string) string {
 	h := sha1.Sum([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+// HasCompleteDownload 是否存在可复用的成品（排除 *.part / *.up.tmp* 等临时文件）。
+func HasCompleteDownload(matches []string) bool {
+	for _, p := range matches {
+		base := strings.ToLower(filepath.Base(p))
+		if strings.HasSuffix(base, ".part") || strings.Contains(base, ".up.tmp") {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // extFromURL 从 URL 提取扩展名

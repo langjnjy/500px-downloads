@@ -55,3 +55,25 @@ func TestRunCubic2x_smoke(t *testing.T) {
 		t.Fatalf("expected 16x12 got %dx%d", gotW, gotH)
 	}
 }
+
+// OpenCV imwrite 按路径末尾扩展名选编码器；*.jpg.up.tmp 会 rc=3，须为 *.up.tmp.jpg。
+func TestRunCubic2x_upTmpBeforeExt(t *testing.T) {
+	dir := t.TempDir()
+	inPath := filepath.Join(dir, "in.png")
+	outPath := filepath.Join(dir, "out.up.tmp.png")
+
+	img := image.NewRGBA(image.Rect(0, 0, 4, 3))
+	f, err := os.Create(inPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	if err := RunCubic2x("", "", inPath, outPath); err != nil {
+		t.Fatal(err)
+	}
+}

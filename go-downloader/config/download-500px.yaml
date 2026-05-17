@@ -9,8 +9,9 @@
 #   2. 不配置 → 自动扫描 output/metadata/extract_metadata_<n>.jsonl，多个按 n 升序依次下载
 # 输出：仅图片文件到 media / media_upscale；不写 {date}.metadata.jsonl。
 # 分辨率满足「最短边>=1080 且 长边>=2000」→ 直存 media；否则 media_upscale → OpenCV cubic 2x → media。
-# seen.db 仅记录下载状态（ok/failed）；ok 表示已成功下载过（本地 media 上传 S3 后删除亦视为 ok，不重复下载）。
-# retry_failed: true 时从 seen.db 的 failed 记录重试；无 failed 时回退 failed_urls 文件。
+# extract_metadata_resolution_policy 三选一：metadata_large / metadata_small / full（默认 full）。
+# seen.db：status=ok/failed/pending_*；route=large_direct/cv2_upscale。
+# retry_failed: false 正常扫 JSONL；true 排空 pending 并重试 failed（full 重试全部 route）。
 # checkpoint：每处理完 checkpoint_interval_lines 行（含 skipped）写入 output/checkpoints/500px_download.ckpt。
 #
 # download.retries：失败后的「额外重试」次数；retries: 3 表示最多共 4 次 HTTP 尝试。
@@ -24,6 +25,7 @@ input_mode: "extract_metadata"
 media_upscale_dir_template: "output/media_upscale"
 resolution_min_short: 1080
 resolution_min_long: 2000
+extract_metadata_resolution_policy: full   # metadata_large | metadata_small | full
 # 以下为可选。省略时：内置 CGO+OpenCV 放大；upscale_workers 默认 4。
 # upscale_python / upscale_script 已弃用（保留字段仅为兼容旧 yaml）。
 upscale_workers: 8

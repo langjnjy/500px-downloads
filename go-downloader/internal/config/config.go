@@ -36,6 +36,7 @@ type Config struct {
 	MediaUpscaleDir           string             `yaml:"-"`
 	ResolutionMinShort        int                `yaml:"resolution_min_short"`
 	ResolutionMinLong         int                `yaml:"resolution_min_long"`
+	ExtractMetadataResolutionPolicy string       `yaml:"extract_metadata_resolution_policy"`
 	UpscalePython             string             `yaml:"upscale_python"`
 	UpscaleScriptTemplate     string             `yaml:"upscale_script"`
 	UpscaleScript             string             `yaml:"-"`
@@ -110,6 +111,7 @@ type pipelineRootYAML struct {
 	MediaUpscaleDirTemplate    string             `yaml:"media_upscale_dir_template"`
 	ResolutionMinShort         int                `yaml:"resolution_min_short"`
 	ResolutionMinLong          int                `yaml:"resolution_min_long"`
+	ExtractMetadataResolutionPolicy string        `yaml:"extract_metadata_resolution_policy"`
 	UpscalePython              string             `yaml:"upscale_python"`
 	UpscaleScript              string             `yaml:"upscale_script"`
 	UpscaleWorkers             int                `yaml:"upscale_workers"`
@@ -242,6 +244,7 @@ func mergePipelineYAML(root *pipelineRootYAML, projectRoot string) (*Config, err
 	cfg.MediaUpscaleDirTemplate = strings.TrimSpace(root.MediaUpscaleDirTemplate)
 	cfg.ResolutionMinShort = root.ResolutionMinShort
 	cfg.ResolutionMinLong = root.ResolutionMinLong
+	cfg.ExtractMetadataResolutionPolicy = strings.TrimSpace(root.ExtractMetadataResolutionPolicy)
 	cfg.UpscalePython = strings.TrimSpace(root.UpscalePython)
 	cfg.UpscaleWorkers = root.UpscaleWorkers
 	upsTpl := strings.TrimSpace(root.UpscaleScript)
@@ -351,6 +354,12 @@ func mergePipelineYAML(root *pipelineRootYAML, projectRoot string) (*Config, err
 	}
 	if strings.TrimSpace(cfg.FailedURLsPathTemplate) == "" {
 		cfg.FailedURLsPathTemplate = "output/pipeline/{category}/download/failed/failed_urls.txt"
+	}
+
+	if cfg.IsExtractMetadataInput() {
+		if _, err := cfg.NormalizedExtractMetadataResolutionPolicy(); err != nil {
+			return nil, err
+		}
 	}
 
 	return cfg, nil
@@ -469,6 +478,42 @@ func (c *Config) IsExtractMetadataInput() bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(c.InputMode), "extract_metadata")
+}
+
+// NormalizedExtractMetadataResolutionPolicy 返回 metadata_large、metadata_small 或 full。
+func (c *Config) NormalizedExtractMetadataResolutionPolicy() (string, error) {
+	if c == nil {
+		return "", fmt.Errorf("config 为 nil")
+	}
+	p := strings.TrimSpace(c.ExtractMetadataResolutionPolicy)
+	if p == "" {
+		return "full", nil
+	}
+	switch strings.ToLower(p) {
+	case "metadata_large":
+		return "metadata_large", nil
+	case "metadata_small":
+		return "metadata_small", nil
+	case "full":
+		return "full", nil
+	default:
+		return "", fmt.Errorf("extract_metadata_resolution_policy 无效: %q，应为 metadata_large、metadata_small 或 full", p)
+	}
+}
+
+func (c *Config) IsExtractMetadataLargeBatch() bool {
+	v, err := c.NormalizedExtractMetadataResolutionPolicy()
+	return err == nil && v == "metadata_large"
+}
+
+func (c *Config) IsExtractMetadataSmallBatch() bool {
+	v, err := c.NormalizedExtractMetadataResolutionPolicy()
+	return err == nil && v == "metadata_small"
+}
+
+func (c *Config) IsExtractMetadataFullBatch() bool {
+	v, err := c.NormalizedExtractMetadataResolutionPolicy()
+	return err == nil && v == "full"
 }
 
 // resolvePath 解析路径，支持模板变量 {category}、{category_plural}（均替换为 category）
