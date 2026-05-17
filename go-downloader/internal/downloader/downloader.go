@@ -26,7 +26,8 @@ var photoID500px = regexp.MustCompile(`500px\.org/photo/(\d+)`)
 // Downloader 下载器
 type Downloader struct {
 	cfg        *config.Config
-	httpClient *http.Client
+	httpClient *http.Client // CDN 下载（可走代理）
+	apiClient  *http.Client // api.500px.com 刷新 URL（优先直连）
 	stats      *Stats
 	userAgents []string
 }
@@ -37,6 +38,14 @@ type Stats struct {
 	Failed  int64
 	Skipped int64
 	mu      sync.RWMutex
+}
+
+// DownloadExtractOpts extract 模式：fileName 固定为 metadata image_key basename；fetch URL 可刷新。
+type DownloadExtractOpts struct {
+	IdentityURL     string // metadata image_url（seen 去重键，不变）
+	InitialFetchURL string // 首次 HTTP 使用的 URL（通常同 IdentityURL）
+	FileName        string // 落盘 basename，来自 image_key
+	PhotoID         string // 500px legacy id，用于 Referer 与 m=4096 刷新
 }
 
 // DownloadResult 下载结果
@@ -89,14 +98,27 @@ func NewDownloader(cfg *config.Config) *Downloader {
 		}
 	}
 
+	timeout := time.Duration(cfg.Timeout) * time.Second
 	httpClient := &http.Client{
-		Timeout:   time.Duration(cfg.Timeout) * time.Second,
+		Timeout:   timeout,
 		Transport: tr,
+	}
+	// api.500px.com：优先直连；数据中心 IP 常被 403，失败时回退走 CDN 同款代理轮询。
+	apiClient := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy:               nil,
+			MaxIdleConns:        32,
+			MaxIdleConnsPerHost: 16,
+			IdleConnTimeout:     90 * time.Second,
+			DisableKeepAlives:   false,
+		},
 	}
 
 	return &Downloader{
 		cfg:        cfg,
 		httpClient: httpClient,
+		apiClient:  apiClient,
 		stats:      &Stats{},
 		userAgents: loadUserAgents(cfg),
 	}
@@ -104,20 +126,32 @@ func NewDownloader(cfg *config.Config) *Downloader {
 
 // Download 下载单个 URL。seen_db 去重在 metadata 写入阶段处理（与 Python 一致）。
 func (d *Downloader) Download(url string, downloadDir string) *DownloadResult {
-	if IsSkipURL(url) {
+	return d.DownloadExtract(DownloadExtractOpts{
+		IdentityURL:     url,
+		InitialFetchURL: url,
+		FileName:        BaseNameForURL(d.cfg, url),
+		PhotoID:         PhotoIDFrom500px(url, ""),
+	}, downloadDir)
+}
+
+// DownloadExtract extract metadata 下载：fileName 固定，HTTP URL 失败时刷新 m=4096 CDN 链接。
+func (d *Downloader) DownloadExtract(opts DownloadExtractOpts, downloadDir string) *DownloadResult {
+	identityURL := strings.TrimSpace(opts.IdentityURL)
+	if identityURL == "" {
+		identityURL = strings.TrimSpace(opts.InitialFetchURL)
+	}
+	if IsSkipURL(identityURL) {
 		atomic.AddInt64(&d.stats.Skipped, 1)
 		return &DownloadResult{Success: false, SkipFailedList: true}
 	}
-	objectID := ObjectIDForURL(d.cfg, url)
-	fileName := BaseNameForURL(d.cfg, url)
+
+	fileName := strings.TrimSpace(opts.FileName)
+	if fileName == "" {
+		fileName = FileNameFromImageKey(d.cfg, "", identityURL)
+	}
+	objectID := ObjectIDFromFileName(fileName)
 	finalPath := filepath.Join(downloadDir, fileName)
 
-	preferExt := ""
-	if IsCrawlHashStyle(d.cfg) {
-		preferExt = GuessExtFromURL500px(url)
-	}
-
-	// 先检查文件是否已存在（与 Python 逻辑一致，先文件后 DB）
 	if d.cfg.DiskGlobFallback {
 		matches, _ := filepath.Glob(filepath.Join(downloadDir, fmt.Sprintf("%s.*", objectID)))
 		if len(matches) > 0 {
@@ -130,35 +164,76 @@ func (d *Downloader) Download(url string, downloadDir string) *DownloadResult {
 	}
 
 	tmpPath := filepath.Join(downloadDir, fmt.Sprintf("%s.part", objectID))
+	photoID := PhotoIDFrom500px(identityURL, opts.PhotoID)
 
-	// 重试下载
+	initialURL := strings.TrimSpace(opts.InitialFetchURL)
+	if initialURL == "" {
+		initialURL = identityURL
+	}
+
 	var result *DownloadResult
 	attempts := d.cfg.Retries + 1
 	for i := 0; i < attempts; i++ {
-		result = d.downloadHTTP(url, tmpPath, objectID, preferExt)
-		if result.Success {
-			break
+		if initialURL != "" {
+			result = d.downloadHTTP(initialURL, tmpPath, fileName, photoID)
+			if result != nil && result.Success {
+				break
+			}
+		}
+		if photoID != "" {
+			if fresh, err := d.refresh500pxCDN4096(photoID); err == nil && fresh != "" && fresh != initialURL {
+				result = d.downloadHTTP(fresh, tmpPath, fileName, photoID)
+				if result != nil && result.Success {
+					break
+				}
+			}
 		}
 		if i < attempts-1 {
-			time.Sleep(time.Duration(i+1) * 100 * time.Millisecond) // 简单退避
+			time.Sleep(time.Duration(i+1) * 100 * time.Millisecond)
 		}
 	}
 
-	if result.Success {
+	if result != nil && result.Success {
 		atomic.AddInt64(&d.stats.Success, 1)
-	} else if result.SkippedLowRes {
+	} else if result != nil && result.SkippedLowRes {
 		atomic.AddInt64(&d.stats.Skipped, 1)
 	} else {
 		atomic.AddInt64(&d.stats.Failed, 1)
 		os.Remove(tmpPath)
 	}
-
+	if result == nil {
+		return &DownloadResult{Success: false, FileName: fileName, ObjectID: objectID}
+	}
 	return result
 }
 
-// downloadHTTP 执行 HTTP 下载。当 MinSidePixels > 0 时先缓冲前 512KB 解析分辨率，最短边 < MinSidePixels 则不落盘、直接丢弃。
-// preferExt 非空时强制用该扩展名落盘（crawl_hash 与 Python guess_ext_from_url 一致）；空则沿用 extFromURL / Content-Type。
-func (d *Downloader) downloadHTTP(url, tmpPath string, objectID string, preferExt string) *DownloadResult {
+// refresh500pxCDN4096 刷新 m=4096 CDN URL：先直连 api.500px.com，403/失败时走代理并重试。
+func (d *Downloader) refresh500pxCDN4096(photoID string) (string, error) {
+	if fresh, err := Refresh500pxCDN4096(d.apiClient, photoID); err == nil && fresh != "" {
+		return fresh, nil
+	} else if d.httpClient == nil || d.httpClient == d.apiClient {
+		return "", err
+	}
+	var lastErr error
+	const proxyTries = 3
+	for i := 0; i < proxyTries; i++ {
+		fresh, err := Refresh500pxCDN4096(d.httpClient, photoID)
+		if err == nil && fresh != "" {
+			return fresh, nil
+		}
+		lastErr = err
+		if err != nil && !apiErrRetryable(err) {
+			return "", err
+		}
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("500px API refresh failed for photo %s", photoID)
+}
+
+// downloadHTTP 执行 HTTP 下载。targetFileName 为最终 basename（与 metadata image_key 一致）。
+func (d *Downloader) downloadHTTP(url, tmpPath, targetFileName, refererPhotoID string) *DownloadResult {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return &DownloadResult{Success: false, Error: err}
@@ -166,11 +241,18 @@ func (d *Downloader) downloadHTTP(url, tmpPath string, objectID string, preferEx
 	if ua := d.pickUserAgent(); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	if m := photoID500px.FindStringSubmatch(url); len(m) >= 2 {
-		req.Header.Set("Referer", "https://500px.com/photo/"+m[1])
+	pid := strings.TrimSpace(refererPhotoID)
+	if pid == "" {
+		if m := photoID500px.FindStringSubmatch(url); len(m) >= 2 {
+			pid = m[1]
+		}
+	}
+	if pid != "" {
+		req.Header.Set("Referer", "https://500px.com/photo/"+pid)
 	} else {
 		req.Header.Set("Referer", "https://500px.com/")
 	}
+	req.Header.Set("Origin", "https://500px.com")
 	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
@@ -184,20 +266,11 @@ func (d *Downloader) downloadHTTP(url, tmpPath string, objectID string, preferEx
 		return &DownloadResult{Success: false, Error: fmt.Errorf("HTTP %d", resp.StatusCode)}
 	}
 
-	var ext string
-	if strings.TrimSpace(preferExt) != "" {
-		ext = strings.TrimSpace(preferExt)
-	} else {
-		ext = extFromURL(url)
-		if ext == "" {
-			contentType := resp.Header.Get("Content-Type")
-			ext = extFromContentType(contentType)
-			if ext == "" {
-				ext = "jpg"
-			}
-		}
+	fileName := strings.TrimSpace(targetFileName)
+	if fileName == "" {
+		fileName = filepath.Base(tmpPath)
 	}
-	fileName := fmt.Sprintf("%s.%s", objectID, ext)
+	objectID := ObjectIDFromFileName(fileName)
 	finalPath := filepath.Join(filepath.Dir(tmpPath), fileName)
 
 	// 先读入内存最多 512KB，用于分辨率检测

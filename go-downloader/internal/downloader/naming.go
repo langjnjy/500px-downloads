@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"path/filepath"
 	"strings"
 
 	"github.com/unsplash_downloads/go-downloader/internal/config"
@@ -43,4 +44,36 @@ func BaseNameForURL(cfg *config.Config, url string) string {
 		return oid + ".jpg"
 	}
 	return oid + "." + ext
+}
+
+// FileNameFromImageKey extract metadata 的 image_key basename；缺失时回退 BaseNameForURL(identityURL)。
+func FileNameFromImageKey(cfg *config.Config, imageKey, identityURL string) string {
+	key := strings.TrimSpace(imageKey)
+	if key != "" {
+		base := filepath.Base(key)
+		if base != "" && base != "." && base != string(filepath.Separator) {
+			return base
+		}
+	}
+	return BaseNameForURL(cfg, identityURL)
+}
+
+// ObjectIDFromFileName 文件名去掉扩展名，用作 .part 临时文件前缀。
+func ObjectIDFromFileName(fileName string) string {
+	ext := filepath.Ext(fileName)
+	if ext == "" {
+		return fileName
+	}
+	return strings.TrimSuffix(fileName, ext)
+}
+
+// PhotoIDFrom500px 从 drscdn URL 或十进制字符串解析 legacy photo id。
+func PhotoIDFrom500px(rawURL, explicitID string) string {
+	if id := strings.TrimSpace(explicitID); id != "" {
+		return id
+	}
+	if m := photoID500px.FindStringSubmatch(rawURL); len(m) >= 2 {
+		return m[1]
+	}
+	return ""
 }

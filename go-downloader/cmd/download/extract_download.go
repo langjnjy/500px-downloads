@@ -23,6 +23,7 @@ import (
 type downloadJob struct {
 	URL            string
 	ImageKey       string
+	PhotoID        string
 	HasMetaSize    bool
 	MetaW, MetaH   int
 	MetaResolution string
@@ -50,9 +51,10 @@ func parseExtractMetadataLine(line string) (downloadJob, bool) {
 		return downloadJob{}, false
 	}
 	var row struct {
-		ImageURL   string `json:"image_url"`
-		Resolution string `json:"resolution"`
-		ImageKey   string `json:"image_key"`
+		ImageURL   string      `json:"image_url"`
+		Resolution string      `json:"resolution"`
+		ImageKey   string      `json:"image_key"`
+		ID         interface{} `json:"id"`
 	}
 	if err := json.Unmarshal([]byte(line), &row); err != nil {
 		return downloadJob{}, false
@@ -64,6 +66,7 @@ func parseExtractMetadataLine(line string) (downloadJob, bool) {
 	j := downloadJob{
 		URL:            url,
 		ImageKey:       strings.TrimSpace(row.ImageKey),
+		PhotoID:        formatPhotoID(row.ID),
 		MetaResolution: strings.TrimSpace(row.Resolution),
 	}
 	if w, h, err := parseWXH(j.MetaResolution); err == nil && w > 0 && h > 0 {
@@ -73,9 +76,23 @@ func parseExtractMetadataLine(line string) (downloadJob, bool) {
 	return j, true
 }
 
+func formatPhotoID(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case float64:
+		return strconv.FormatInt(int64(x), 10)
+	case json.Number:
+		return strings.TrimSpace(x.String())
+	default:
+		return ""
+	}
+}
+
 func downloadJobFromURL(url, resolution string, lineIndex int64) downloadJob {
 	j := downloadJob{
 		URL:            url,
+		PhotoID:        downloader.PhotoIDFrom500px(url, ""),
 		MetaResolution: resolution,
 		LineIndex:      lineIndex,
 		ByteOffset:     lineIndex + 1,
@@ -334,7 +351,16 @@ func (s *downloadSession) mediaFileName(job downloadJob, r *downloader.DownloadR
 	if r != nil && strings.TrimSpace(r.FileName) != "" {
 		return r.FileName
 	}
-	return downloader.BaseNameForURL(s.cfg, job.URL)
+	return downloader.FileNameFromImageKey(s.cfg, job.ImageKey, job.URL)
+}
+
+func (s *downloadSession) downloadExtract(job downloadJob, dir string) *downloader.DownloadResult {
+	return s.dl.DownloadExtract(downloader.DownloadExtractOpts{
+		IdentityURL:     job.URL,
+		InitialFetchURL: job.URL,
+		FileName:        downloader.FileNameFromImageKey(s.cfg, job.ImageKey, job.URL),
+		PhotoID:         downloader.PhotoIDFrom500px(job.URL, job.PhotoID),
+	}, dir)
 }
 
 func (s *downloadSession) shouldSkip(dedupe string) bool {
@@ -394,7 +420,7 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 	}
 
 	if job.HasMetaSize && s.tierFromDims(job.MetaW, job.MetaH) {
-		r := s.dl.Download(job.URL, s.outputDir)
+		r := s.downloadExtract(job, s.outputDir)
 		switch s.classifyDownload(r, s.outputDir) {
 		case downloadOutcomeExists, downloadOutcomeOK:
 			s.markOK(dedupe, job.URL, s.resolutionNote(job, r))
@@ -410,7 +436,7 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 	}
 
 	if job.HasMetaSize && !s.tierFromDims(job.MetaW, job.MetaH) {
-		r := s.dl.Download(job.URL, s.upscaleDir)
+		r := s.downloadExtract(job, s.upscaleDir)
 		switch s.classifyDownload(r, s.upscaleDir) {
 		case downloadOutcomeFail:
 			s.markFailed(dedupe, job.URL, s.resolutionNote(job, r))
@@ -424,7 +450,7 @@ func (s *downloadSession) ProcessJob(job downloadJob) {
 		return
 	}
 
-	r := s.dl.Download(job.URL, s.upscaleDir)
+	r := s.downloadExtract(job, s.upscaleDir)
 	switch s.classifyDownload(r, s.upscaleDir) {
 	case downloadOutcomeFail:
 		s.markFailed(dedupe, job.URL, s.resolutionNote(job, r))
